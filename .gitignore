@@ -1,6 +1,17 @@
+# Python
 venv/
+.venv/
 __pycache__/
-*.pyc
-data/raw/*
-data/processed/*
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Local environment
 .env
+
+# Data artifacts (reproducible via `python -m src.data.fetch_binance`)
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
