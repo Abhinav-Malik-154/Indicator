@@ -1,0 +1,33 @@
+# Configuration for the BTC/USDT market-data pipeline (Phase 1).
+#
+# All dates are interpreted as UTC. `start_date` is inclusive; `end_date` is
+# exclusive. `end_date: null` (or "today"/"now") means "up to the most recent
+# fully closed candle at pull time" — the still-forming candle is never stored.
+
+data:
+  symbol: BTCUSDT
+  intervals: ["1d", "1h", "30m"]
+  start_date: "2020-01-01"
+  end_date: null
+
+binance:
+  base_url: "https://api.binance.com"
+  page_limit: 1000              # Binance hard cap per /api/v3/klines request
+  request_timeout_s: 30
+  max_retries: 5                # retries per page on transient errors (429/418/5xx/network)
+  backoff_base_s: 1.0           # exponential backoff: base * 2**attempt, Retry-After respected
+  sleep_between_requests_s: 0.25
+
+paths:
+  raw_dir: "data/raw"
+  file_prefix: "btc_usdt"       # -> data/raw/btc_usdt_{interval}.parquet / .csv / .manifest.json
+  processed_dir: "data/processed"  # -> data/processed/features_{interval}.parquet / .manifest.json
+
+# Feature-build windows (Phase 2). All windows are trailing and positional
+# (counted in candles): a feature at candle T uses candles <= T only.
+features:
+  return_periods: [1, 3, 7, 14]
+  volatility_windows: [7, 14, 30]
+  volume_window: 20
+  ma_windows: [7, 30]
+  sr_window: 30
