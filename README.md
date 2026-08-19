@@ -19,9 +19,15 @@ leakage, so this project treats data integrity as a first-class requirement:
 ## Project status
 
 **Phase 1 (done):** production-grade BTC/USDT data pipeline against the Binance
-public REST API. **Phase 2 (current):** leakage-safe feature engineering.
-Later phases will design labels with equal care, compare predictability across
-timeframes (1d vs 1h vs 30m), and evaluate models honestly.
+public REST API. **Phase 2 (done):** leakage-safe feature engineering —
+candlestick patterns, technical indicators (returns, volatility, volume,
+context, intra-candle shape), RSI, MACD, standalone validation guards
+(`validate_no_lookahead`, `validate_feature_label_alignment`), and a
+deliberate-leak test that proves the guard catches future-data usage.
+**Phase 3 (done):** forward-return label design with dead-zone noise
+exclusion, alignment validation, and class-balance reporting.
+Later phases will compare predictability across timeframes (1d vs 1h vs 30m)
+and evaluate models honestly.
 
 ## Repository layout
 
@@ -29,12 +35,17 @@ timeframes (1d vs 1h vs 30m), and evaluate models honestly.
 configs/config.yaml               # symbol, intervals, date range, API, windows, paths
 src/data/fetch_binance.py         # fetch -> validate -> save pipeline (CLI entry point)
 src/features/candlestick.py       # TA-Lib CDL* pattern features + fire-rate reporting
-src/features/technical.py         # returns / volatility / volume / context / intra-candle
+src/features/technical.py         # returns / volatility / volume / context / RSI / MACD
 src/features/build_features.py    # feature build CLI: gap accounting + manifests
-tests/                            # unit tests incl. the no-look-ahead leakage test
+src/features/validate_features.py # no-lookahead guard + feature-label alignment check
+src/labels/build_labels.py        # forward-return labels with dead zone + class balance
+src/labels/validate_labels.py     # derivation correctness + feature-label alignment checks
+tests/                            # unit tests incl. leakage + deliberate-leak + alignment
 notebooks/01_feature_sanity.ipynb # visual sanity checks only — no logic in notebooks
+notebooks/02_label_sanity.ipynb   # label colour overlay, balance chart, return distribution
+notebooks/03_feature_sanity.ipynb # Phase 2: RSI/MACD plots, correlation matrix, spot-checks
 data/raw/                         # candles: parquet + CSV + manifest (git-ignored)
-data/processed/                   # feature tables + manifests (git-ignored)
+data/processed/                   # feature / label tables + manifests (git-ignored)
 .github/workflows/ci.yml          # ruff + pytest on every push / PR
 ```
 
@@ -93,6 +104,8 @@ Feature families (windows configurable in `configs/config.yaml`):
 | volume | `volume_vs_ma_20`, `volume_z_20` |
 | context | `close_vs_ma_{7,30}`, `dist_from_high_30`, `dist_from_low_30` |
 | intra-candle | `body_pct`, `upper_wick_pct`, `lower_wick_pct`, `close_pos_in_range` |
+| momentum | `rsi_14` (Wilder's smoothed RSI) |
+| trend | `macd_line`, `macd_signal`, `macd_hist` (12/26/9 EMA-based) |
 | candlestick | all TA-Lib `CDL*` patterns that fire in the data (one int column each) |
 
 Candlestick values live in `{-200, -100, -80, 0, 80, 100, 200}`: Hikkake
@@ -104,6 +117,58 @@ wall-clock. Gap records from the Phase 1 manifests are read back during the
 build, and every feature row whose longest lookback window spans a recorded
 gap is counted and written to the build manifest — candles are never filled,
 interpolated, or synthesised. Rows without full rolling history keep NaN.
+
+## Building labels
+
+```bash
+python -m src.labels.build_labels                          # all intervals -> data/processed/
+python -m src.labels.build_labels --intervals 1d           # subset
+```
+
+The label iron rule: the label at row T is the *answer key* — it deliberately
+looks forward to `close[T+N]`. But labels live in a **separate file**
+(`labels_{interval}.parquet`), never merged into the features file. The two
+are joined only at training time on `open_time`.
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `horizons` | `[1]` | forward-return horizon in candles |
+| `dead_zone_pct` | `0.15` | moves within ±0.15% are excluded (NaN) — noise filter |
+
+Classification: `label = 1` if `close[T+N]/close[T] - 1 > +threshold`,
+`label = 0` if `< -threshold`, `NaN` if inside the dead zone or if
+`close[T+N]` does not exist (the last N rows). The dead zone uses strict
+inequalities: a return of exactly ±threshold is excluded.
+
+Alignment between features and labels is validated by
+`src/labels/validate_labels.py` and `src/features/validate_features.py`,
+which check derivation correctness, join integrity (no off-by-one, no
+duplication), and namespace separation. The deliberate-leak test in
+`tests/test_features.py` intentionally shifts a feature by -1 and asserts
+that `validate_no_lookahead` catches it — this proves the guard works,
+not just that it passes clean code.
+
+## Split strategy (Phase 4 — documented, not yet implemented)
+
+The intended train/val/test split is **time-based walk-forward**, not
+random shuffle:
+
+1. **Chronological ordering**: the split respects time — training data
+   always precedes validation, which always precedes test. No future data
+   ever leaks into training through the split itself.
+2. **Walk-forward validation**: the training window expands (or slides)
+   forward in time; the model is re-evaluated on each subsequent block.
+3. **Dead-zone and tail-NaN handling at boundaries**: at each split
+   boundary, the last `max(horizons)` rows of the training segment have
+   NaN labels (no `close[T+N]` exists beyond the boundary). These rows
+   are excluded from training — they carry features but no answer key.
+   Similarly, the first `longest_lookback_rows` of each segment carry
+   NaN features (warm-up). These are excluded from evaluation.
+4. **No overlap**: a gap of at least `max(horizons)` candles separates
+   training from validation to prevent the label at the last training
+   row from depending on prices in the validation window.
+
+This will be implemented in Phase 4 alongside the modelling pipeline.
 
 ## Tests and lint
 

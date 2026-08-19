@@ -12,3 +12,8 @@ known-first-party = ["src"]
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-ra"
+
+[tool.pyrefly]
+# Match pytest's pythonpath=["."] so IDE type-checking resolves
+# "from src.X import ..." the same way runtime does.
+search_path = ["."]
