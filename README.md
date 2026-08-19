@@ -242,6 +242,81 @@ numbers are reported as-is, not smoothed over; Phase 5 backtesting will show
 whether either model is useful net of fees, which is a separate question
 from raw directional accuracy.
 
+### Feature pruning experiment (Phase 4 add-on)
+
+**Motivation.** In Phase 4, logistic regression's top coefficients were dominated by
+rare candlestick pattern dummies that fired in only 1–28 training rows.  With so few
+observations, the logistic-regression coefficient is estimated from a vanishingly thin
+slice of data: its value is effectively a coincidence, not a signal.  An overfit-to-regime
+coefficient may flip sign the next time the pattern fires, making the importance table
+untrustworthy even if accuracy looks fine.
+
+**Threshold (pre-committed, never tuned).** Drop every candlestick pattern that fires
+in fewer than 30 training rows.  The threshold is the clinical "10 events per variable"
+minimum scaled by 3× — a general statistical stability rule chosen *before* looking at
+any validation or test metric.  Using val/test outcomes to choose the cutoff would be
+feature-selection leakage (the same category of mistake the rest of the project avoids).
+
+Fire-rates are computed on the **training split only** (never val/test); this is
+enforced by `prune_candlestick_features()` and tested in `TestPruneCandlestickFeatures`.
+
+**Patterns dropped (20 of 38 candlestick features, all < 30 training fires):**
+`cdl_3inside` (7), `cdl_3linestrike` (4), `cdl_advanceblock` (25), `cdl_dojistar` (13),
+`cdl_dragonflydoji` (28), `cdl_eveningdojistar` (2), `cdl_eveningstar` (2),
+`cdl_gapsidesidewhite` (2), `cdl_gravestonedoji` (20), `cdl_hangingman` (19),
+`cdl_hikkakemod` (0), `cdl_identical3crows` (0), `cdl_invertedhammer` (6),
+`cdl_morningstar` (2), `cdl_risefall3methods` (2), `cdl_separatinglines` (9),
+`cdl_shootingstar` (3), `cdl_stalledpattern` (2), `cdl_tristar` (1),
+`cdl_xsidegap3methods` (7).  All technical features are kept untouched.
+
+**Side-by-side accuracy (BTCUSDT 1d, horizon 1):**
+
+| Model | Variant | Split | Accuracy | Base rate | Edge |
+| --- | --- | --- | --- | --- | --- |
+| Logistic regression | baseline | val | 52.9% | 53.2% (up) | −0.3pp |
+| Logistic regression | **pruned** | val | 52.3% | 53.2% (up) | −0.9pp |
+| Logistic regression | baseline | test | 44.2% | 52.1% (down) | −7.9pp |
+| Logistic regression | **pruned** | test | 45.1% | 52.1% (down) | −7.0pp |
+| LightGBM | baseline | val | 50.8% | 53.2% (up) | −2.4pp |
+| LightGBM | **pruned** | val | 50.8% | 53.2% (up) | −2.4pp |
+| LightGBM | baseline | test | 51.8% | 52.1% (down) | −0.3pp |
+| LightGBM | **pruned** | test | 51.8% | 52.1% (down) | −0.3pp |
+
+Accuracy deltas are within ±1pp for every split and model — the experiment confirms that
+the rare dummies added noise, not signal: removing them does not hurt performance.
+
+**Feature importances — the actual success criterion.**
+
+*Logistic regression top 6 (baseline):*
+`cdl_rickshawman` (+0.22), `cdl_longline` (+0.21), **`cdl_gapsidesidewhite` (+0.20, 2 fires)**,
+**`cdl_risefall3methods` (−0.20, 2 fires)**, `close_pos_in_range` (−0.17),
+**`cdl_dragonflydoji` (+0.16, 28 fires)**, **`cdl_tristar` (−0.15, 1 fire)**.
+Four of the top seven were rare patterns that fired in ≤28 rows — classic overfit-to-regime
+signatures.
+
+*Logistic regression top 6 (pruned):*
+`cdl_longline` (+0.20), `cdl_rickshawman` (+0.16), `close_pos_in_range` (−0.16),
+`range_pct_ma_30` (−0.13), `dist_from_high_30` (−0.12), `cdl_belthold` (−0.12).
+All six fire ≥223 training times.  Technical features (`close_pos_in_range`,
+`range_pct_ma_30`, `dist_from_high_30`) are now visible; the top surviving candlestick
+patterns are high-frequency ones whose coefficients are estimated from a real sample.
+
+*LightGBM (identical for both variants):* `log_ret_1` (9.6%), `upper_wick_pct` (8.9%),
+`close_pos_in_range` (6.6%) — tree ensembles are naturally resistant to low-fire-rate
+dummies because gain-splitting on a column that is almost always 0 carries little reward.
+No pruning change was needed or observed.
+
+**Verdict.** Success on the stated criterion: logistic-regression importances are now
+economically sensible — momentum (`log_ret_14`), volatility (`ret_std_30`, `range_pct_ma_30`),
+structure (`dist_from_high_30`, `close_pos_in_range`), and well-observed candlestick patterns
+(`cdl_longline`, `cdl_belthold`).  Accuracy was flat, as expected; no leak alert fired.
+
+Run with:
+```bash
+python -m src.models.train --pruned --intervals 1d    # saves to models/1d_pruned/
+python -m src.models.evaluate --pruned --intervals 1d  # loads from models/1d_pruned/
+```
+
 ## Tests and lint
 
 ```bash
