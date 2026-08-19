@@ -15,3 +15,7 @@ data/raw/*
 !data/raw/.gitkeep
 data/processed/*
 !data/processed/.gitkeep
+
+# Model artifacts (reproducible via `python -m src.models.train`)
+models/*
+!models/.gitkeep
