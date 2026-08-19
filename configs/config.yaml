@@ -72,3 +72,8 @@ modeling:
     colsample_bytree: 0.8
     reg_lambda: 1.0
     early_stopping_rounds: 50 # stop when validation logloss stalls this many rounds
+  pruning:
+    # Candlestick features fired in fewer than this many training rows are dropped
+    # before fitting models.  Threshold is pre-committed from statistical reasoning
+    # (the "events per variable" minimum); it is NEVER tuned to val/test outcomes.
+    min_fire_rows: 30

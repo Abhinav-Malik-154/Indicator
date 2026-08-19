@@ -240,7 +240,12 @@ def flag_suspicious_importances(
 # ---------------------------------------------------------------------------
 
 
-def load_artifacts(interval: str, cfg: dict[str, Any]) -> dict[str, Any]:
+def load_artifacts(
+    interval: str,
+    cfg: dict[str, Any],
+    *,
+    model_variant: str = "",
+) -> dict[str, Any]:
     """Load persisted models, scaler, and training manifest for one interval.
 
     Cross-checks the manifest against the current config and data files:
@@ -250,6 +255,8 @@ def load_artifacts(interval: str, cfg: dict[str, Any]) -> dict[str, Any]:
     Args:
         interval: Binance interval string, e.g. ``"1d"``.
         cfg: Config dict from :func:`load_modeling_config`.
+        model_variant: Optional variant suffix, e.g. ``"pruned"`` loads from
+            ``models/{interval}_pruned/`` instead of ``models/{interval}/``.
 
     Returns:
         Dict with ``scaler``, ``logistic_regression``, ``lightgbm`` and
@@ -259,13 +266,15 @@ def load_artifacts(interval: str, cfg: dict[str, Any]) -> dict[str, Any]:
         FileNotFoundError: If artifacts are missing.
         ValueError: If the manifest disagrees with the current data/config.
     """
-    context = f"{cfg['symbol']} {interval}"
-    out_dir = Path(cfg["models_dir"]) / interval
+    dir_name = f"{interval}_{model_variant}" if model_variant else interval
+    context = f"{cfg['symbol']} {interval}" + (f" ({model_variant})" if model_variant else "")
+    out_dir = Path(cfg["models_dir"]) / dir_name
     manifest_path = out_dir / "training_manifest.json"
     if not manifest_path.is_file():
+        flag = " --pruned" if model_variant == "pruned" else ""
         raise FileNotFoundError(
             f"{context}: {manifest_path} not found — run "
-            "`python -m src.models.train` first"
+            f"`python -m src.models.train{flag}` first"
         )
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
@@ -353,7 +362,12 @@ def format_split_report(
     return "\n".join(lines)
 
 
-def evaluate_interval(interval: str, cfg: dict[str, Any]) -> dict[str, Any]:
+def evaluate_interval(
+    interval: str,
+    cfg: dict[str, Any],
+    *,
+    model_variant: str = "",
+) -> dict[str, Any]:
     """Evaluate both trained models on the validation and test splits.
 
     Re-assembles the dataset through the training code path, re-derives the
@@ -363,21 +377,39 @@ def evaluate_interval(interval: str, cfg: dict[str, Any]) -> dict[str, Any]:
     Args:
         interval: Binance interval string, e.g. ``"1d"``.
         cfg: Config dict from :func:`load_modeling_config`.
+        model_variant: Optional variant suffix.  ``"pruned"`` loads from
+            ``models/{interval}_pruned/`` and uses the manifest's (pruned)
+            feature list rather than requiring an exact match with the full
+            feature set.
 
     Returns:
         Dict with all metric dicts plus ``leak_alerts`` and
         ``importance_warnings`` lists (empty means nothing suspicious).
     """
-    context = f"{cfg['symbol']} {interval}"
+    context = (
+        f"{cfg['symbol']} {interval}"
+        + (f" ({model_variant})" if model_variant else "")
+    )
     modeling = cfg["modeling"]
-    artifacts = load_artifacts(interval, cfg)
+    artifacts = load_artifacts(interval, cfg, model_variant=model_variant)
     manifest = artifacts["manifest"]
 
-    merged, feature_cols = assemble_dataset(interval, cfg)
-    if feature_cols != manifest["feature_cols"]:
-        raise ValueError(
-            f"{context}: feature columns changed since training — retrain first"
-        )
+    merged, all_feature_cols = assemble_dataset(interval, cfg)
+    if model_variant:
+        # Pruned variant: manifest records the subset of features the models
+        # were trained on.  Verify they are all still available in the data.
+        feature_cols: list[str] = manifest["feature_cols"]
+        missing = [c for c in feature_cols if c not in all_feature_cols]
+        if missing:
+            raise ValueError(
+                f"{context}: manifest feature cols missing from data: {missing}"
+            )
+    else:
+        feature_cols = all_feature_cols
+        if feature_cols != manifest["feature_cols"]:
+            raise ValueError(
+                f"{context}: feature columns changed since training — retrain first"
+            )
     bounds = make_split_bounds(
         len(merged),
         train_frac=modeling["split"]["train_frac"],
@@ -522,6 +554,14 @@ def main(argv: list[str] | None = None) -> int:
         help="override modeling.intervals from the config",
     )
     parser.add_argument(
+        "--pruned",
+        action="store_true",
+        help=(
+            "evaluate the candlestick-pruned models from models/{interval}_pruned/ "
+            "instead of the base models"
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -536,12 +576,13 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg = load_modeling_config(args.config)
     intervals: list[str] = args.intervals or cfg["modeling"]["intervals"]
+    model_variant = "pruned" if args.pruned else ""
 
     failures: list[str] = []
     leak_alerts: list[str] = []
     for interval in intervals:
         try:
-            report = evaluate_interval(interval, cfg)
+            report = evaluate_interval(interval, cfg, model_variant=model_variant)
             leak_alerts += report["leak_alerts"]
         except Exception:
             logger.exception("%s %s: evaluation failed", cfg["symbol"], interval)

@@ -72,6 +72,10 @@ _LIGHTGBM_DEFAULTS: dict[str, Any] = {
     "early_stopping_rounds": 50,
 }
 
+_PRUNING_DEFAULTS: dict[str, Any] = {
+    "min_fire_rows": 30,
+}
+
 _MODELING_DEFAULTS: dict[str, Any] = {
     "intervals": ["1d"],
     "horizon": 1,
@@ -81,6 +85,7 @@ _MODELING_DEFAULTS: dict[str, Any] = {
     "random_state": 42,
     "logistic_regression": None,
     "lightgbm": None,
+    "pruning": None,
 }
 
 
@@ -212,6 +217,14 @@ def load_modeling_config(path: str | Path) -> dict[str, Any]:
     modeling["lightgbm"] = _merge_section(
         modeling["lightgbm"], _LIGHTGBM_DEFAULTS, "lightgbm"
     )
+    modeling["pruning"] = _merge_section(
+        modeling["pruning"], _PRUNING_DEFAULTS, "pruning"
+    )
+    min_fire = modeling["pruning"]["min_fire_rows"]
+    if not isinstance(min_fire, int) or isinstance(min_fire, bool) or min_fire < 1:
+        raise ValueError(
+            f"config: modeling.pruning.min_fire_rows must be an integer >= 1, got {min_fire!r}"
+        )
 
     return {**cfg, "models_dir": models_dir, "modeling": modeling}
 
@@ -525,6 +538,72 @@ def train_lightgbm(
 
 
 # ---------------------------------------------------------------------------
+# Candlestick feature pruning
+# ---------------------------------------------------------------------------
+
+
+def prune_candlestick_features(
+    train_df: pd.DataFrame,
+    feature_cols: list[str],
+    *,
+    min_fire_rows: int,
+    context: str = "",
+) -> tuple[list[str], list[str]]:
+    """Drop candlestick pattern columns that fire too rarely in the training split.
+
+    A candlestick column fires when its value is != 0 (TA-Lib uses 0 for
+    "pattern not detected").  Fire-rates are computed on ``train_df`` only —
+    calling this function on the full dataset instead of the training split
+    would leak future statistics into the feature-selection decision.
+
+    Threshold justification (pre-committed, not tuned to any outcome):
+    30 training occurrences — the "10 events per variable" clinical minimum
+    scaled to 3×, well below which logistic-regression coefficient variance
+    grows rapidly and rare binary dummies become noise amplifiers.
+
+    Args:
+        train_df: Training split DataFrame (features + optionally label).
+            Only the ``cdl_*`` columns are read.
+        feature_cols: Full feature column list from :func:`assemble_dataset`.
+        min_fire_rows: Keep a pattern only if it fires (value != 0) in at
+            least this many training rows.
+        context: Label for log messages.
+
+    Returns:
+        Tuple of ``(kept_feature_cols, dropped_cdl_names)``:
+
+        - ``kept_feature_cols``: ``feature_cols`` with rare candlestick
+          patterns removed; non-candlestick features are never touched.
+        - ``dropped_cdl_names``: candlestick column names that were removed.
+    """
+    label = context or "prune"
+    cdl_cols = [c for c in feature_cols if c.startswith("cdl_")]
+    if not cdl_cols:
+        logger.info("%s: no candlestick columns found — nothing to prune", label)
+        return list(feature_cols), []
+
+    fire_counts = (train_df[cdl_cols] != 0).sum()
+    dropped = sorted(fire_counts.index[fire_counts < min_fire_rows].tolist())
+    dropped_set = set(dropped)
+
+    kept_feature_cols = [c for c in feature_cols if c not in dropped_set]
+
+    logger.info(
+        "%s: candlestick pruning (min_fire_rows=%d): "
+        "%d patterns total, dropping %d (< %d training fires), keeping %d",
+        label, min_fire_rows, len(cdl_cols), len(dropped), min_fire_rows,
+        len(cdl_cols) - len(dropped),
+    )
+    if dropped:
+        drop_detail = ", ".join(
+            f"{c}({int(fire_counts[c])})" for c in dropped
+        )
+        logger.info("%s: dropped: %s", label, drop_detail)
+
+    return kept_feature_cols, dropped
+
+
+# ---------------------------------------------------------------------------
 # Training pipeline
 # ---------------------------------------------------------------------------
 
@@ -632,6 +711,127 @@ def train_interval(interval: str, cfg: dict[str, Any]) -> dict[str, Any]:
     return manifest
 
 
+def train_pruned_interval(interval: str, cfg: dict[str, Any]) -> dict[str, Any]:
+    """Run the pruned training pipeline and persist artifacts to ``{interval}_pruned/``.
+
+    Identical to :func:`train_interval` except that rare candlestick pattern
+    columns are dropped **before** either model is fit.  The pruning decision
+    uses the training split only (``modeling.pruning.min_fire_rows`` rows
+    threshold, chosen before any val/test peek — see
+    :func:`prune_candlestick_features`).
+
+    Args:
+        interval: Binance interval string, e.g. ``"1d"``.
+        cfg: Config dict from :func:`load_modeling_config`.
+
+    Returns:
+        The training manifest that was written next to the artifacts.
+    """
+    context = f"{cfg['symbol']} {interval} (pruned)"
+    modeling = cfg["modeling"]
+    horizon: int = modeling["horizon"]
+    label_col = f"label_{horizon}"
+    min_fire_rows: int = modeling["pruning"]["min_fire_rows"]
+
+    merged, feature_cols = assemble_dataset(interval, cfg)
+    bounds = make_split_bounds(
+        len(merged),
+        train_frac=modeling["split"]["train_frac"],
+        val_frac=modeling["split"]["val_frac"],
+        gap_candles=modeling["split"]["gap_candles"],
+        context=context,
+    )
+    # Split boundaries and NaN drop are identical to the base pipeline —
+    # candlestick columns don't carry NaN so no rows shift across boundaries.
+    splits = split_dataset(
+        merged, bounds, feature_cols=feature_cols, label_col=label_col,
+        context=context,
+    )
+
+    # Pruning uses training split only — call before ever touching val/test.
+    pruned_feature_cols, dropped_patterns = prune_candlestick_features(
+        splits["train"],
+        feature_cols,
+        min_fire_rows=min_fire_rows,
+        context=context,
+    )
+
+    x_train = splits["train"][pruned_feature_cols]
+    y_train = splits["train"][label_col].astype("int64")
+    x_val = splits["val"][pruned_feature_cols]
+    y_val = splits["val"][label_col].astype("int64")
+
+    scaler = fit_scaler_on_train(x_train)
+    x_train_scaled = pd.DataFrame(
+        scaler.transform(x_train), columns=pruned_feature_cols, index=x_train.index
+    )
+
+    seed: int = modeling["random_state"]
+    logreg = train_logistic_regression(
+        x_train_scaled, y_train,
+        params=modeling["logistic_regression"], random_state=seed,
+    )
+    booster = train_lightgbm(
+        x_train, y_train, x_val, y_val,
+        params=modeling["lightgbm"], random_state=seed,
+    )
+
+    out_dir = Path(cfg["models_dir"]) / f"{interval}_pruned"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    artifact_paths = {
+        "scaler": out_dir / "scaler.joblib",
+        "logistic_regression": out_dir / "logistic_regression.joblib",
+        "lightgbm": out_dir / "lightgbm.joblib",
+    }
+    joblib.dump(scaler, artifact_paths["scaler"])
+    joblib.dump(logreg, artifact_paths["logistic_regression"])
+    joblib.dump(booster, artifact_paths["lightgbm"])
+
+    manifest: dict[str, Any] = {
+        "symbol": cfg["symbol"],
+        "interval": interval,
+        "variant": "pruned",
+        "trained_at_utc": pd.Timestamp.now(tz="UTC").isoformat(timespec="seconds"),
+        "horizon": horizon,
+        "label_col": label_col,
+        "feature_cols": pruned_feature_cols,
+        "all_feature_cols": feature_cols,
+        "dropped_cdl_patterns": dropped_patterns,
+        "pruning_min_fire_rows": min_fire_rows,
+        "n_rows_full": len(merged),
+        "split_bounds": asdict(bounds),
+        "usable_rows": {name: len(df) for name, df in splits.items()},
+        "modeling_config": modeling,
+        "lightgbm_best_iteration": booster.best_iteration_,
+        "inputs": {
+            "features": {
+                "path": str(Path(cfg["processed_dir"]) / f"features_{interval}.parquet"),
+                "sha256": sha256_of(
+                    Path(cfg["processed_dir"]) / f"features_{interval}.parquet"
+                ),
+            },
+            "labels": {
+                "path": str(Path(cfg["processed_dir"]) / f"labels_{interval}.parquet"),
+                "sha256": sha256_of(
+                    Path(cfg["processed_dir"]) / f"labels_{interval}.parquet"
+                ),
+            },
+        },
+        "artifacts": {name: str(path) for name, path in artifact_paths.items()},
+        "iron_rule": (
+            "split boundaries on the full table before NaN drop; "
+            "scaler fit on the training split only; "
+            "candlestick fire-rates computed on the training split only"
+        ),
+    }
+    manifest_path = out_dir / "training_manifest.json"
+    with manifest_path.open("w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, indent=2)
+        fh.write("\n")
+    logger.info("%s: wrote %s and %d artifact(s)", context, manifest_path, len(artifact_paths))
+    return manifest
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -662,6 +862,15 @@ def main(argv: list[str] | None = None) -> int:
         help="override modeling.intervals from the config",
     )
     parser.add_argument(
+        "--pruned",
+        action="store_true",
+        help=(
+            "run the candlestick-pruning experiment: drop rare CDL patterns "
+            "(< modeling.pruning.min_fire_rows training fires) before fitting; "
+            "saves to models/{interval}_pruned/"
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -676,11 +885,12 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg = load_modeling_config(args.config)
     intervals: list[str] = args.intervals or cfg["modeling"]["intervals"]
+    runner = train_pruned_interval if args.pruned else train_interval
 
     failures: list[str] = []
     for interval in intervals:
         try:
-            train_interval(interval, cfg)
+            runner(interval, cfg)
         except Exception:
             logger.exception("%s %s: training failed", cfg["symbol"], interval)
             failures.append(interval)

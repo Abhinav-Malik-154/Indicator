@@ -434,6 +434,98 @@ class TestModelingConfig:
             train.load_modeling_config(broken_path)
 
 
+class TestPruneCandlestickFeatures:
+    """prune_candlestick_features must use only the provided data (never the full dataset)."""
+
+    def test_drops_patterns_below_threshold(self):
+        n = 100
+        df = pd.DataFrame({
+            "cdl_common": [100 if i % 3 == 0 else 0 for i in range(n)],  # fires 34 times
+            "cdl_rare":   [100 if i < 5 else 0 for i in range(n)],       # fires 5 times
+            "not_cdl":    np.arange(n, dtype="float64"),
+        })
+        feature_cols = ["not_cdl", "cdl_common", "cdl_rare"]
+        kept, dropped = train.prune_candlestick_features(df, feature_cols, min_fire_rows=30)
+        assert "cdl_rare" in dropped
+        assert "cdl_common" not in dropped
+        assert kept == ["not_cdl", "cdl_common"]
+
+    def test_result_differs_between_train_and_full_dataset(self):
+        """Calling on training-only data vs full data produces different results.
+
+        This is the central anti-leakage property: a pattern that fires only
+        28 times in training (below threshold) but 60 times in the full
+        dataset (above threshold) must be dropped when the function is called
+        on training data.  If the function secretly used the full dataset
+        instead, both calls would return the same result — which they don't.
+        """
+        n_train, n_full = 50, 200
+        train_df = pd.DataFrame({
+            "cdl_marginal": [100 if i < 28 else 0 for i in range(n_train)],
+            "not_cdl":      np.arange(n_train, dtype="float64"),
+        })
+        full_df = pd.DataFrame({
+            "cdl_marginal": [100 if i < 60 else 0 for i in range(n_full)],
+            "not_cdl":      np.arange(n_full, dtype="float64"),
+        })
+        feature_cols = ["not_cdl", "cdl_marginal"]
+
+        kept_train, dropped_train = train.prune_candlestick_features(
+            train_df, feature_cols, min_fire_rows=30
+        )
+        kept_full, dropped_full = train.prune_candlestick_features(
+            full_df, feature_cols, min_fire_rows=30
+        )
+
+        # On training data (28 fires): dropped — below threshold.
+        assert "cdl_marginal" in dropped_train
+        assert "cdl_marginal" not in kept_train
+
+        # On the full dataset (60 fires): kept — above threshold.
+        # The two results differ, which proves the function uses only the
+        # data it was given, not some global state.
+        assert "cdl_marginal" in kept_full
+        assert not dropped_full
+
+    def test_non_cdl_features_are_never_dropped(self):
+        n = 100
+        df = pd.DataFrame({
+            "log_ret_1": np.random.default_rng(0).normal(size=n),
+            "rsi_14":    np.random.default_rng(1).uniform(20, 80, size=n),
+            "cdl_once":  [100 if i == 0 else 0 for i in range(n)],  # fires 1 time
+        })
+        feature_cols = ["log_ret_1", "rsi_14", "cdl_once"]
+        kept, dropped = train.prune_candlestick_features(df, feature_cols, min_fire_rows=30)
+        assert "log_ret_1" in kept
+        assert "rsi_14" in kept
+        assert "cdl_once" in dropped
+
+    def test_no_cdl_columns_returns_unchanged(self):
+        n = 50
+        df = pd.DataFrame({
+            "log_ret_1": np.arange(n, dtype="float64"),
+            "rsi_14":    np.arange(n, dtype="float64"),
+        })
+        feature_cols = ["log_ret_1", "rsi_14"]
+        kept, dropped = train.prune_candlestick_features(df, feature_cols, min_fire_rows=30)
+        assert kept == feature_cols
+        assert dropped == []
+
+    def test_train_pruned_interval_produces_artifacts(self, tmp_path):
+        """End-to-end smoke: pruned pipeline writes artifacts to {interval}_pruned/."""
+        config_path = _write_fixture(tmp_path)
+        cfg = train.load_modeling_config(config_path)
+        manifest = train.train_pruned_interval("1h", cfg)
+        out_dir = tmp_path / "models" / "1h_pruned"
+        assert (out_dir / "scaler.joblib").is_file()
+        assert (out_dir / "logistic_regression.joblib").is_file()
+        assert (out_dir / "lightgbm.joblib").is_file()
+        assert (out_dir / "training_manifest.json").is_file()
+        assert manifest["variant"] == "pruned"
+        # Dropped patterns must be a subset of the original feature cols.
+        assert all(c not in manifest["feature_cols"] for c in manifest["dropped_cdl_patterns"])
+
+
 class TestFairScalerBaseline:
     """Sanity check that fit_scaler_on_train matches plain StandardScaler semantics."""
 
