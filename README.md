@@ -26,13 +26,16 @@ context, intra-candle shape), RSI, MACD, standalone validation guards
 deliberate-leak test that proves the guard catches future-data usage.
 **Phase 3 (done):** forward-return label design with dead-zone noise
 exclusion, alignment validation, and class-balance reporting.
-Later phases will compare predictability across timeframes (1d vs 1h vs 30m)
-and evaluate models honestly.
+**Phase 4 (done):** walk-forward-split modeling — logistic regression
+baseline, LightGBM gradient boosting, confidence gating, an automated
+leak tripwire, and honest accuracy-vs-base-rate reporting.
+Phase 5 (next) will backtest with realistic fees and slippage, then compare
+predictability across timeframes (1d vs 1h vs 30m).
 
 ## Repository layout
 
 ```
-configs/config.yaml               # symbol, intervals, date range, API, windows, paths
+configs/config.yaml               # symbol, intervals, date range, API, windows, paths, modeling
 src/data/fetch_binance.py         # fetch -> validate -> save pipeline (CLI entry point)
 src/features/candlestick.py       # TA-Lib CDL* pattern features + fire-rate reporting
 src/features/technical.py         # returns / volatility / volume / context / RSI / MACD
@@ -40,12 +43,17 @@ src/features/build_features.py    # feature build CLI: gap accounting + manifest
 src/features/validate_features.py # no-lookahead guard + feature-label alignment check
 src/labels/build_labels.py        # forward-return labels with dead zone + class balance
 src/labels/validate_labels.py     # derivation correctness + feature-label alignment checks
+src/models/train.py               # walk-forward split, scaler-on-train-only, logreg + LightGBM
+src/models/evaluate.py            # accuracy vs base rate, importances, gating, leak tripwire
 tests/                            # unit tests incl. leakage + deliberate-leak + alignment
 notebooks/01_feature_sanity.ipynb # visual sanity checks only — no logic in notebooks
 notebooks/02_label_sanity.ipynb   # label colour overlay, balance chart, return distribution
 notebooks/03_feature_sanity.ipynb # Phase 2: RSI/MACD plots, correlation matrix, spot-checks
+notebooks/04_model_evaluation.ipynb # Phase 4: probability dist, confusion matrix, importances,
+                                   #   accuracy-by-confidence-bucket
 data/raw/                         # candles: parquet + CSV + manifest (git-ignored)
 data/processed/                   # feature / label tables + manifests (git-ignored)
+models/                           # trained artifacts + training manifest (git-ignored)
 .github/workflows/ci.yml          # ruff + pytest on every push / PR
 ```
 
@@ -148,27 +156,91 @@ duplication), and namespace separation. The deliberate-leak test in
 that `validate_no_lookahead` catches it — this proves the guard works,
 not just that it passes clean code.
 
-## Split strategy (Phase 4 — documented, not yet implemented)
+## Modeling (Phase 4)
 
-The intended train/val/test split is **time-based walk-forward**, not
-random shuffle:
+```bash
+python -m src.models.train                     # trains all modeling.intervals -> models/
+python -m src.models.train --intervals 1d       # subset
+python -m src.models.evaluate --intervals 1d    # honest evaluation report
+```
+
+### Split strategy — time-based walk-forward, not random shuffle
 
 1. **Chronological ordering**: the split respects time — training data
-   always precedes validation, which always precedes test. No future data
-   ever leaks into training through the split itself.
-2. **Walk-forward validation**: the training window expands (or slides)
-   forward in time; the model is re-evaluated on each subsequent block.
-3. **Dead-zone and tail-NaN handling at boundaries**: at each split
-   boundary, the last `max(horizons)` rows of the training segment have
-   NaN labels (no `close[T+N]` exists beyond the boundary). These rows
-   are excluded from training — they carry features but no answer key.
-   Similarly, the first `longest_lookback_rows` of each segment carry
-   NaN features (warm-up). These are excluded from evaluation.
-4. **No overlap**: a gap of at least `max(horizons)` candles separates
-   training from validation to prevent the label at the last training
-   row from depending on prices in the validation window.
+   always precedes validation, which always precedes test. Boundaries are
+   computed positionally on the full joined feature+label table **before**
+   any NaN row is dropped, so no statistic derived from the split (or from
+   the NaN pattern, which depends on labels) can influence where a row
+   lands.
+2. **No overlap**: a configurable gap (`modeling.split.gap_candles`, must be
+   `>= modeling.horizon`) separates training from validation and validation
+   from test, so the label at the last row of one segment never depends on
+   a close price inside the next segment.
+3. **NaN handling after boundaries, not before**: within each split, rows
+   with a warm-up feature (insufficient rolling history) or a dead-zone/tail
+   label are dropped. Because this happens after the split boundaries are
+   fixed, dropped rows never shift a row across a boundary.
+4. **Scaler fit on training data only**: `StandardScaler` is `.fit()` on the
+   training split's features and only `.transform()`-ed onto validation and
+   test — verified by `tests/test_models.py`, which asserts the fitted
+   scaler's mean/scale are unaffected by data it never saw.
 
-This will be implemented in Phase 4 alongside the modelling pipeline.
+### Models
+
+- **Logistic regression** — the fair, interpretable baseline. Trained on
+  scaled features (mean 0, unit variance, scaler fit on train only).
+- **LightGBM** — gradient boosting, trained on unscaled features (trees are
+  scale-invariant) with early stopping on the validation split's log loss.
+
+Both are interval-agnostic: `modeling.intervals` in `configs/config.yaml`
+controls which intervals get trained; 1d runs first, 1h/30m can be added
+later without code changes.
+
+### Confidence gating
+
+A configurable probability threshold (`modeling.confidence_threshold`,
+default 0.60) turns raw probabilities into a three-way signal: emit "up" if
+`P(up) > threshold`, "down" if `P(up) < 1 - threshold`, otherwise stay
+silent. `evaluate.py` reports accuracy for "all predictions" and "signals
+fired" separately, plus signal coverage — the gated number is what an
+indicator built on this would actually use.
+
+### Leak tripwire
+
+If any model's out-of-sample accuracy exceeds `modeling.leak_alert_accuracy`
+(default 65%), `evaluate.py` logs an error, stamps the report
+**PROBABLE LEAK**, and exits with code 2 instead of presenting the number as
+a result. A single feature carrying more than half of total importance
+triggers the same kind of warning — both are checked automatically, not left
+to manual review.
+
+### Honest results — BTCUSDT 1d, horizon 1
+
+Trained on `data/processed/features_1d.parquet` + `labels_1d.parquet`
+(2,415 rows). Split: train 1,557 usable rows (2020-01-31 → 2024-08-16), val
+329 rows (2024-08-18 → 2025-08-14), test 328 rows (2025-08-17 → 2026-08-10),
+gap of 1 candle at each boundary.
+
+| Model | Split | Accuracy | Base rate | Edge |
+| --- | --- | --- | --- | --- |
+| Logistic regression | val | 52.9% | 53.2% (up) | −0.3pp |
+| Logistic regression | test | 44.2% | 52.1% (down) | −7.9pp |
+| LightGBM | val | 50.8% | 53.2% (up) | −2.4pp |
+| LightGBM | test | 51.8% | 52.1% (down) | −0.3pp |
+
+No leak alert fired (nothing exceeds 65%) and no single feature dominates
+importance (LightGBM's top feature, `log_ret_1`, carries 9.6% of gain).
+Read plainly: on this split, neither model beats the base rate — consistent
+with the 50–58% honest-accuracy expectation stated at the top of this
+README, and with directional prediction on daily BTC being a genuinely hard
+problem. Confidence gating does not yet help either: gated ("signals fired")
+accuracy is below ungated accuracy for logistic regression on both splits,
+and LightGBM's gated signals are thin (16–30 predictions, all one-directional
+on both splits) — see `notebooks/04_model_evaluation.ipynb` for the
+accuracy-by-confidence-bucket chart this conclusion is based on. These
+numbers are reported as-is, not smoothed over; Phase 5 backtesting will show
+whether either model is useful net of fees, which is a separate question
+from raw directional accuracy.
 
 ## Tests and lint
 
