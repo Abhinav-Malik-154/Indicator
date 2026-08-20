@@ -29,8 +29,9 @@ exclusion, alignment validation, and class-balance reporting.
 **Phase 4 (done):** walk-forward-split modeling — logistic regression
 baseline, LightGBM gradient boosting, confidence gating, an automated
 leak tripwire, and honest accuracy-vs-base-rate reporting.
-Phase 5 (next) will backtest with realistic fees and slippage, then compare
-predictability across timeframes (1d vs 1h vs 30m).
+**Phase 5 (done):** backtesting with realistic fees and slippage —
+strategy equity curves, comparison vs buy-and-hold, and an honest verdict.
+Phase 6 (next) will compare predictability across timeframes (1d vs 1h vs 30m).
 
 ## Repository layout
 
@@ -45,12 +46,16 @@ src/labels/build_labels.py        # forward-return labels with dead zone + class
 src/labels/validate_labels.py     # derivation correctness + feature-label alignment checks
 src/models/train.py               # walk-forward split, scaler-on-train-only, logreg + LightGBM
 src/models/evaluate.py            # accuracy vs base rate, importances, gating, leak tripwire
+src/backtest/simulate.py          # day-by-day equity simulation with per-side fees + slippage
+src/backtest/baseline.py          # buy-and-hold baseline (1 entry + 1 exit fee)
+src/backtest/report.py            # comparison table + CLI for Phase 5
 tests/                            # unit tests incl. leakage + deliberate-leak + alignment
 notebooks/01_feature_sanity.ipynb # visual sanity checks only — no logic in notebooks
 notebooks/02_label_sanity.ipynb   # label colour overlay, balance chart, return distribution
 notebooks/03_feature_sanity.ipynb # Phase 2: RSI/MACD plots, correlation matrix, spot-checks
 notebooks/04_model_evaluation.ipynb # Phase 4: probability dist, confusion matrix, importances,
                                    #   accuracy-by-confidence-bucket
+notebooks/05_backtest_results.ipynb # Phase 5: equity curves, drawdown, comparison table
 data/raw/                         # candles: parquet + CSV + manifest (git-ignored)
 data/processed/                   # feature / label tables + manifests (git-ignored)
 models/                           # trained artifacts + training manifest (git-ignored)
@@ -316,6 +321,76 @@ Run with:
 python -m src.models.train --pruned --intervals 1d    # saves to models/1d_pruned/
 python -m src.models.evaluate --pruned --intervals 1d  # loads from models/1d_pruned/
 ```
+
+## Backtesting (Phase 5)
+
+```bash
+python -m src.backtest.report                     # runs on modeling.intervals
+python -m src.backtest.report --intervals 1d       # subset
+python -m src.backtest.report --log-level DEBUG    # verbose
+```
+
+### Methodology
+
+The backtest uses the **pruned model's predictions on the test split only.**
+Val was used for early stopping (model selection) in Phase 4, so it is not a
+clean out-of-sample proxy — only the test split qualifies as "real future".
+
+**Signal-to-trade logic:** on days with a confidence-gated signal
+(`P(up) > 0.60` → long; `P(up) < 0.40` → short), the simulation takes a full
+position at that day's close.  On silent days, it holds cash.
+
+**Cost structure (configured in `backtest:` in `configs/config.yaml`):**
+
+| Cost item | Rate | Applied |
+| --- | --- | --- |
+| Taker fee | 0.1% per side | every entry **and** every exit |
+| Slippage | 0.1% per side | every entry **and** every exit |
+| Total round-trip | ~0.4% | per trade |
+
+Buy-and-hold pays the same per-side rate but only once on entry and once on
+exit — one trade total, no intermediate fees (no intermediate trades to charge).
+
+**Iron rule:** position at T is set from signal[T] which uses only features
+known at close[T].  The return that position earns is
+`close[T+1] / close[T] − 1` — applied strictly after signal[T] is committed.
+
+### Results — BTCUSDT 1d, test split (2025-08-17 → 2026-08-11, 359 days)
+
+BTC fell **−46%** during this window.
+
+| Metric | LR (pruned) | LGB (pruned) | Buy-and-hold |
+| --- | --- | --- | --- |
+| Total return | −48.8% | **−33.5%** | −46.1% |
+| CAGR | −49.4% | −33.9% | −46.6% |
+| Sharpe ratio | −2.10 | −1.68 | −1.08 |
+| Max drawdown | −50.2% | −37.5% | −53.0% |
+| # trades | 53 | 23 | 1 |
+| Win rate | 34.0% | 47.8% | n/a |
+| Avg trade P&L | −1.03% | −1.40% | −45.9% |
+
+### Honest verdict
+
+**LGB appears to outperform buy-and-hold (−33.5% vs −46.1%), but this is a
+regime-specific illusion, not directional edge.**
+
+LGB fired only 30 signals in 328 days — 91% cash.  Being mostly absent from a
+market that fell 46% naturally produces better-looking numbers than buy-and-hold.
+The same low-coverage model would massively underperform in a bull market, missing
+most of the upside while paying fees on the few signals it does fire.
+
+**LR underperforms buy-and-hold (−48.8% vs −46.1%).**  Its 49 long signals
+landed in downtrend windows, and 53 round-trips consumed roughly 10 percentage
+points in fees alone.
+
+**No model should be traded with real money based on these results.**  Phase 4
+found no directional edge over the base rate; Phase 5 confirms that real costs
+(0.4% per round-trip) eliminate any marginal gain once friction is applied.  The
+Sharpe ratio is negative for all three configurations, which is the expected
+outcome for any system operating in a sustained downtrend with no demonstrated
+edge.
+
+See `notebooks/05_backtest_results.ipynb` for equity curves and the drawdown chart.
 
 ## Tests and lint
 
