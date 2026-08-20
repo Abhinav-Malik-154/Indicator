@@ -77,3 +77,10 @@ modeling:
     # before fitting models.  Threshold is pre-committed from statistical reasoning
     # (the "events per variable" minimum); it is NEVER tuned to val/test outcomes.
     min_fire_rows: 30
+
+# Backtesting settings (Phase 5).  Costs are applied per side (entry and exit
+# separately) to both the strategy and the buy-and-hold baseline.
+backtest:
+  fee_rate: 0.001        # Binance taker fee: 0.1% per side (standard VIP-0 spot rate)
+  slippage_rate: 0.001   # conservative market-impact estimate: 0.1% per side
+  starting_notional: 10000.0  # USD notional at start of test window
