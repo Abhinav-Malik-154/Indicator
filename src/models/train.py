@@ -235,7 +235,10 @@ def load_modeling_config(path: str | Path) -> dict[str, Any]:
 
 
 def assemble_dataset(
-    interval: str, cfg: dict[str, Any]
+    interval: str,
+    cfg: dict[str, Any],
+    *,
+    include_onchain: bool = False,
 ) -> tuple[pd.DataFrame, list[str]]:
     """Join features and labels for one interval, guarded against misalignment.
 
@@ -247,6 +250,9 @@ def assemble_dataset(
     Args:
         interval: Binance interval string, e.g. ``"1d"``.
         cfg: Config dict from :func:`load_modeling_config`.
+        include_onchain: When ``True``, include ``onchain_*`` columns in the
+            returned feature list.  Defaults to ``False`` so that base and
+            pruned models are unaffected when the on-chain parquet is present.
 
     Returns:
         Tuple of (merged DataFrame, feature column names).  Feature columns
@@ -295,6 +301,7 @@ def assemble_dataset(
         if col != "open_time"
         and not col.startswith("fwd_return_")
         and not col.startswith("label_")
+        and (include_onchain or not col.startswith("onchain_"))
     ]
     # Defence in depth: the alignment guard already enforces the label-file
     # namespace, but a forward-looking column in the feature matrix would be
@@ -302,9 +309,10 @@ def assemble_dataset(
     leaked = [c for c in feature_cols if c.startswith(("fwd_return_", "label_"))]
     assert not leaked, f"{context}: forward-looking columns in features: {leaked}"
 
+    n_onchain = sum(1 for c in feature_cols if c.startswith("onchain_"))
     logger.info(
-        "%s: assembled dataset — %d rows, %d feature columns, horizon=%d",
-        context, len(merged), len(feature_cols), horizon,
+        "%s: assembled dataset — %d rows, %d feature columns (%d on-chain), horizon=%d",
+        context, len(merged), len(feature_cols), n_onchain, horizon,
     )
     return merged, feature_cols
 
@@ -832,6 +840,140 @@ def train_pruned_interval(interval: str, cfg: dict[str, Any]) -> dict[str, Any]:
     return manifest
 
 
+def train_onchain_interval(interval: str, cfg: dict[str, Any]) -> dict[str, Any]:
+    """Train models with price + on-chain features; save to ``{interval}_onchain/``.
+
+    Identical to :func:`train_pruned_interval` (candlestick pruning applied)
+    except that ``onchain_*`` feature columns are included via
+    :func:`assemble_dataset` with ``include_onchain=True``.  This gives a
+    clean 3-way comparison: base price-only, pruned price-only, pruned+onchain.
+
+    Args:
+        interval: Binance interval string, e.g. ``"1d"``.
+        cfg: Config dict from :func:`load_modeling_config`.
+
+    Returns:
+        The training manifest that was written next to the artifacts.
+
+    Raises:
+        FileNotFoundError: If on-chain feature columns are absent from the
+            feature parquet (run ``build_features`` after ``fetch_onchain``).
+        ValueError: If no ``onchain_*`` columns are found in the feature table.
+    """
+    context = f"{cfg['symbol']} {interval} (onchain)"
+    modeling = cfg["modeling"]
+    horizon: int = modeling["horizon"]
+    label_col = f"label_{horizon}"
+    min_fire_rows: int = modeling["pruning"]["min_fire_rows"]
+
+    merged, feature_cols = assemble_dataset(interval, cfg, include_onchain=True)
+
+    onchain_present = [c for c in feature_cols if c.startswith("onchain_")]
+    if not onchain_present:
+        raise ValueError(
+            f"{context}: no onchain_* columns found in feature table — "
+            "run `python -m src.data.fetch_onchain` then `python -m src.features.build_features` first"
+        )
+    logger.info("%s: %d on-chain feature(s): %s", context, len(onchain_present), onchain_present)
+
+    bounds = make_split_bounds(
+        len(merged),
+        train_frac=modeling["split"]["train_frac"],
+        val_frac=modeling["split"]["val_frac"],
+        gap_candles=modeling["split"]["gap_candles"],
+        context=context,
+    )
+    splits = split_dataset(
+        merged, bounds, feature_cols=feature_cols, label_col=label_col,
+        context=context,
+    )
+
+    # Prune rare candlestick patterns on the training split only
+    pruned_feature_cols, dropped_patterns = prune_candlestick_features(
+        splits["train"],
+        feature_cols,
+        min_fire_rows=min_fire_rows,
+        context=context,
+    )
+
+    x_train = splits["train"][pruned_feature_cols]
+    y_train = splits["train"][label_col].astype("int64")
+    x_val = splits["val"][pruned_feature_cols]
+    y_val = splits["val"][label_col].astype("int64")
+
+    scaler = fit_scaler_on_train(x_train)
+    x_train_scaled = pd.DataFrame(
+        scaler.transform(x_train), columns=pruned_feature_cols, index=x_train.index
+    )
+
+    seed: int = modeling["random_state"]
+    logreg = train_logistic_regression(
+        x_train_scaled, y_train,
+        params=modeling["logistic_regression"], random_state=seed,
+    )
+    booster = train_lightgbm(
+        x_train, y_train, x_val, y_val,
+        params=modeling["lightgbm"], random_state=seed,
+    )
+
+    out_dir = Path(cfg["models_dir"]) / f"{interval}_onchain"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    artifact_paths = {
+        "scaler": out_dir / "scaler.joblib",
+        "logistic_regression": out_dir / "logistic_regression.joblib",
+        "lightgbm": out_dir / "lightgbm.joblib",
+    }
+    joblib.dump(scaler, artifact_paths["scaler"])
+    joblib.dump(logreg, artifact_paths["logistic_regression"])
+    joblib.dump(booster, artifact_paths["lightgbm"])
+
+    manifest: dict[str, Any] = {
+        "symbol": cfg["symbol"],
+        "interval": interval,
+        "variant": "onchain",
+        "trained_at_utc": pd.Timestamp.now(tz="UTC").isoformat(timespec="seconds"),
+        "horizon": horizon,
+        "label_col": label_col,
+        "feature_cols": pruned_feature_cols,
+        "all_feature_cols": feature_cols,
+        "onchain_feature_cols": onchain_present,
+        "dropped_cdl_patterns": dropped_patterns,
+        "pruning_min_fire_rows": min_fire_rows,
+        "n_rows_full": len(merged),
+        "split_bounds": asdict(bounds),
+        "usable_rows": {name: len(df) for name, df in splits.items()},
+        "modeling_config": modeling,
+        "lightgbm_best_iteration": booster.best_iteration_,
+        "inputs": {
+            "features": {
+                "path": str(Path(cfg["processed_dir"]) / f"features_{interval}.parquet"),
+                "sha256": sha256_of(
+                    Path(cfg["processed_dir"]) / f"features_{interval}.parquet"
+                ),
+            },
+            "labels": {
+                "path": str(Path(cfg["processed_dir"]) / f"labels_{interval}.parquet"),
+                "sha256": sha256_of(
+                    Path(cfg["processed_dir"]) / f"labels_{interval}.parquet"
+                ),
+            },
+        },
+        "artifacts": {name: str(path) for name, path in artifact_paths.items()},
+        "iron_rule": (
+            "split boundaries on the full table before NaN drop; "
+            "scaler fit on the training split only; "
+            "candlestick fire-rates computed on the training split only; "
+            "on-chain features use 1-day lag (candle T uses data from T-1)"
+        ),
+    }
+    manifest_path = out_dir / "training_manifest.json"
+    with manifest_path.open("w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, indent=2)
+        fh.write("\n")
+    logger.info("%s: wrote %s and %d artifact(s)", context, manifest_path, len(artifact_paths))
+    return manifest
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -871,6 +1013,14 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--onchain",
+        action="store_true",
+        help=(
+            "train with price + on-chain features (requires fetch_onchain + build_features "
+            "to have been run first); saves to models/{interval}_onchain/"
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -885,7 +1035,12 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg = load_modeling_config(args.config)
     intervals: list[str] = args.intervals or cfg["modeling"]["intervals"]
-    runner = train_pruned_interval if args.pruned else train_interval
+    if args.onchain:
+        runner = train_onchain_interval
+    elif args.pruned:
+        runner = train_pruned_interval
+    else:
+        runner = train_interval
 
     failures: list[str] = []
     for interval in intervals:

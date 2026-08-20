@@ -144,7 +144,10 @@ def build_test_signals(
     artifacts = load_artifacts(interval, cfg, model_variant=model_variant)
     manifest = artifacts["manifest"]
 
-    merged, all_feature_cols = assemble_dataset(interval, cfg)
+    include_onchain = (model_variant == "onchain")
+    merged, all_feature_cols = assemble_dataset(
+        interval, cfg, include_onchain=include_onchain
+    )
     feature_cols: list[str] = manifest["feature_cols"]
     missing = [c for c in feature_cols if c not in all_feature_cols]
     if missing:

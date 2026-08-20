@@ -37,6 +37,7 @@ from src.data.fetch_binance import (
     sha256_of,
 )
 from src.features.candlestick import compute_candlestick_features, max_pattern_lookback_rows
+from src.features.onchain import build_onchain_features
 from src.features.technical import (
     compute_technical_features,
     longest_lookback_rows,
@@ -100,7 +101,9 @@ def load_features_config(path: str | Path) -> dict[str, Any]:
     validate_window("rsi_period", features["rsi_period"], minimum=2)
     validate_macd_config(features["macd"])
 
-    return {**cfg, "processed_dir": processed_dir, "features": features}
+    onchain_cfg = raw.get("onchain") or {}
+
+    return {**cfg, "processed_dir": processed_dir, "features": features, "onchain_cfg": onchain_cfg}
 
 
 def load_gap_records(manifest_path: str | Path, context: str = "") -> list[dict[str, Any]]:
@@ -225,6 +228,36 @@ def build_features_for_interval(interval: str, cfg: dict[str, Any]) -> dict[str,
     cdl, cdl_report = compute_candlestick_features(df, context=context)
     features = pd.concat([df[["open_time"]], tech, cdl], axis=1)
 
+    # Optional on-chain features: included when data file exists (Phase 6)
+    onchain_cfg = cfg.get("onchain_cfg") or {}
+    onchain_path = Path(cfg["raw_dir"]) / "btc_onchain_1d.parquet"
+    onchain_cols: list[str] = []
+    if onchain_path.is_file():
+        oc_feat = build_onchain_features(
+            df,
+            onchain_path,
+            lag_days=onchain_cfg.get("reporting_lag_days", 1),
+            z_score_windows=onchain_cfg.get("z_score_windows", [7, 30]),
+            wow_window=onchain_cfg.get("wow_window", 7),
+            max_forward_fill_days=onchain_cfg.get("max_forward_fill_days", 3),
+            context=context,
+        )
+        oc_feat_cols = [c for c in oc_feat.columns if c != "open_time"]
+        features = features.merge(oc_feat, on="open_time", how="left")
+        onchain_cols = oc_feat_cols
+        logger.info(
+            "%s: merged %d on-chain feature column(s) into feature table",
+            context,
+            len(onchain_cols),
+        )
+    else:
+        logger.info(
+            "%s: %s not found — skipping on-chain features; "
+            "run `python -m src.data.fetch_onchain` to include them",
+            context,
+            onchain_path,
+        )
+
     technical_lookback = longest_lookback_rows(**cfg["features"])
     candlestick_lookback = max_pattern_lookback_rows()
     lookback_rows = max(technical_lookback, candlestick_lookback)
@@ -290,6 +323,7 @@ def build_features_for_interval(interval: str, cfg: dict[str, Any]) -> dict[str,
         "features": {
             "technical": list(tech.columns),
             "candlestick": list(cdl.columns),
+            "onchain": onchain_cols,
         },
         "nan_report": {
             "rows_with_any_nan": rows_with_any_nan,

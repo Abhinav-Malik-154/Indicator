@@ -394,10 +394,13 @@ def evaluate_interval(
     artifacts = load_artifacts(interval, cfg, model_variant=model_variant)
     manifest = artifacts["manifest"]
 
-    merged, all_feature_cols = assemble_dataset(interval, cfg)
+    include_onchain = (model_variant == "onchain")
+    merged, all_feature_cols = assemble_dataset(
+        interval, cfg, include_onchain=include_onchain
+    )
     if model_variant:
-        # Pruned variant: manifest records the subset of features the models
-        # were trained on.  Verify they are all still available in the data.
+        # Pruned/onchain variant: manifest records the subset of features the
+        # models were trained on.  Verify they are all still available.
         feature_cols: list[str] = manifest["feature_cols"]
         missing = [c for c in feature_cols if c not in all_feature_cols]
         if missing:
@@ -562,6 +565,13 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--onchain",
+        action="store_true",
+        help=(
+            "evaluate the price+onchain models from models/{interval}_onchain/"
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -576,7 +586,12 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg = load_modeling_config(args.config)
     intervals: list[str] = args.intervals or cfg["modeling"]["intervals"]
-    model_variant = "pruned" if args.pruned else ""
+    if args.onchain:
+        model_variant = "onchain"
+    elif args.pruned:
+        model_variant = "pruned"
+    else:
+        model_variant = ""
 
     failures: list[str] = []
     leak_alerts: list[str] = []
