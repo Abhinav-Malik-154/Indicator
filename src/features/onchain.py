@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -189,7 +188,8 @@ def validate_onchain_no_lookahead(
         step = max(1, (len(candle_df) - mid) // 10)
         sample_points = list(range(mid, len(candle_df), step))[:10]
 
-    import tempfile, os
+    import os
+    import tempfile
 
     for t in sample_points:
         candle_time_t = candle_df["open_time"].iloc[t]
@@ -220,7 +220,10 @@ def validate_onchain_no_lookahead(
         for col in onchain_cols:
             fv = full_row[col]
             tv = trunc_row[col]
-            both_nan = isinstance(fv, float) and isinstance(tv, float) and np.isnan(fv) and np.isnan(tv)
+            both_nan = (
+                isinstance(fv, float) and isinstance(tv, float)
+                and np.isnan(fv) and np.isnan(tv)
+            )
             if not both_nan and not np.isclose(fv, tv, equal_nan=True):
                 raise AssertionError(
                     f"{label}: LOOKAHEAD at row {t} (open_time={candle_time_t.date()}) "

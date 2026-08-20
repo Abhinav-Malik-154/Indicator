@@ -311,7 +311,7 @@ def fetch_and_save(
         logger.warning(w)
     if errors:
         raise ValueError(
-            f"On-chain data failed validation:\n" + "\n".join(errors)
+            "On-chain data failed validation:\n" + "\n".join(errors)
         )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -337,7 +337,10 @@ def fetch_and_save(
     manifest: dict[str, Any] = {
         "built_at_utc": pd.Timestamp.now(tz="UTC").isoformat(timespec="seconds"),
         "source": "Blockchain.com Charts API (free, no auth)",
-        "source_url_template": f"{cfg['base_url']}/{{chart_name}}?timespan={cfg['timespan']}&sampled=false",
+        "source_url_template": (
+            f"{cfg['base_url']}/{{chart_name}}"
+            f"?timespan={cfg['timespan']}&sampled=false"
+        ),
         "not_available_for_free": [
             "exchange_netflow (Glassnode/CryptoQuant paid)",
             "whale_movement (paid tracking services)",

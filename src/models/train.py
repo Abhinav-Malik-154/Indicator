@@ -872,7 +872,8 @@ def train_onchain_interval(interval: str, cfg: dict[str, Any]) -> dict[str, Any]
     if not onchain_present:
         raise ValueError(
             f"{context}: no onchain_* columns found in feature table — "
-            "run `python -m src.data.fetch_onchain` then `python -m src.features.build_features` first"
+            "run `python -m src.data.fetch_onchain` then "
+            "`python -m src.features.build_features` first"
         )
     logger.info("%s: %d on-chain feature(s): %s", context, len(onchain_present), onchain_present)
 

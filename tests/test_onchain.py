@@ -13,9 +13,6 @@ Coverage:
 
 from __future__ import annotations
 
-import json
-import os
-import tempfile
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -36,7 +33,6 @@ from src.features.onchain import (
     build_onchain_features,
     validate_onchain_no_lookahead,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -412,7 +408,9 @@ class TestOnchainLagCorrectness:
     def _build(self, candle_df, onchain_df, tmp_path, lag=1):
         path = tmp_path / "oc_tmp.parquet"
         onchain_df.to_parquet(path, engine="pyarrow", index=False)
-        return build_onchain_features(candle_df, path, lag_days=lag, z_score_windows=[7], wow_window=7)
+        return build_onchain_features(
+            candle_df, path, lag_days=lag, z_score_windows=[7], wow_window=7
+        )
 
     def test_feature_at_T_unchanged_when_day_T_on_chain_data_removed(self, tmp_path):
         """Remove on-chain data for day T; features at T should be unchanged."""
@@ -560,7 +558,6 @@ class TestGapHandling:
     def test_forward_fill_bridges_small_gaps(self, tmp_path):
         """A 2-day gap in on-chain data is filled when max_forward_fill_days >= 2."""
         candles = _make_candle_df(30)
-        dates = pd.date_range(_BASE_DATE, periods=30, freq="D", tz="UTC")
         oc = _make_onchain_df(n=30)
         # Create a gap: remove rows 10 and 11
         oc_with_gap = pd.concat(
