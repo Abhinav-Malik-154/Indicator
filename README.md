@@ -31,7 +31,10 @@ baseline, LightGBM gradient boosting, confidence gating, an automated
 leak tripwire, and honest accuracy-vs-base-rate reporting.
 **Phase 5 (done):** backtesting with realistic fees and slippage —
 strategy equity curves, comparison vs buy-and-hold, and an honest verdict.
-Phase 6 (next) will compare predictability across timeframes (1d vs 1h vs 30m).
+**Phase 6 (done):** Bitcoin on-chain features from the Blockchain.com Charts API
+(free, no auth) — 5 metrics × 3 transformations = 15 features added to the
+pipeline, with a 1-day conservative lag, no-lookahead validation, and a 3-way
+comparison against price-only models.
 
 ## Repository layout
 
@@ -49,6 +52,8 @@ src/models/evaluate.py            # accuracy vs base rate, importances, gating, 
 src/backtest/simulate.py          # day-by-day equity simulation with per-side fees + slippage
 src/backtest/baseline.py          # buy-and-hold baseline (1 entry + 1 exit fee)
 src/backtest/report.py            # comparison table + CLI for Phase 5
+src/data/fetch_onchain.py         # Blockchain.com Charts API fetcher (Phase 6, free)
+src/features/onchain.py           # on-chain feature engineering: lag + z-scores + WoW
 tests/                            # unit tests incl. leakage + deliberate-leak + alignment
 notebooks/01_feature_sanity.ipynb # visual sanity checks only — no logic in notebooks
 notebooks/02_label_sanity.ipynb   # label colour overlay, balance chart, return distribution
@@ -56,6 +61,7 @@ notebooks/03_feature_sanity.ipynb # Phase 2: RSI/MACD plots, correlation matrix,
 notebooks/04_model_evaluation.ipynb # Phase 4: probability dist, confusion matrix, importances,
                                    #   accuracy-by-confidence-bucket
 notebooks/05_backtest_results.ipynb # Phase 5: equity curves, drawdown, comparison table
+notebooks/06_onchain_analysis.ipynb # Phase 6: on-chain metrics vs price, 3-way comparison
 data/raw/                         # candles: parquet + CSV + manifest (git-ignored)
 data/processed/                   # feature / label tables + manifests (git-ignored)
 models/                           # trained artifacts + training manifest (git-ignored)
@@ -391,6 +397,83 @@ outcome for any system operating in a sustained downtrend with no demonstrated
 edge.
 
 See `notebooks/05_backtest_results.ipynb` for equity curves and the drawdown chart.
+
+## On-chain features (Phase 6)
+
+### What was available for free
+
+**Source**: Blockchain.com Charts API (`https://api.blockchain.info/charts/{metric}?timespan=7years&sampled=false&format=json`).
+No API key required.  Coverage: 2019-08-22 → present.
+
+| Metric | API chart name | Coverage (at fetch time) |
+| --- | --- | --- |
+| Active addresses | `n-unique-addresses` | 2019-08-22 → 2026-08-16 |
+| Transaction count | `n-transactions` | 2019-08-22 → 2026-08-16 |
+| Hash rate (TH/s) | `hash-rate` | 2019-08-22 → 2026-08-16 |
+| Fees (USD) | `transaction-fees-usd` | 2019-08-22 → 2026-08-16 |
+| Volume (USD) | `estimated-transaction-volume-usd` | 2019-08-22 → 2026-08-19 |
+
+**NOT available for free (stated honestly):**
+- **Exchange netflows** — Glassnode / CryptoQuant paid tier
+- **Whale movement / large-transaction tracking** — paid services
+- **HODL waves / coin age distribution** — Glassnode paid
+- **Realized price, NUPL, STH/LTH supply** — Glassnode paid
+
+### Feature engineering
+
+- **Reporting lag**: conservative 1-day shift.  On-chain data for day T is finalized at midnight UTC end of T.  We use T-1 data for candle T — so no decision ever depends on the same day's blockchain activity.
+- **Rolling z-scores**: 7-day and 30-day normalised values for each metric.
+- **Week-over-week % change**: `(value / value.shift(7) - 1) × 100` for each metric.
+- **Total**: 5 metrics × 3 transformations = **15 on-chain features**, all prefixed `onchain_`.
+
+### Running Phase 6
+
+```bash
+# Step 1: fetch raw on-chain data
+python -m src.data.fetch_onchain
+
+# Step 2: rebuild features (on-chain columns added automatically)
+python -m src.features.build_features --intervals 1d
+
+# Step 3: retrain all variants
+python -m src.models.train --intervals 1d          # base (price-only)
+python -m src.models.train --intervals 1d --pruned # pruned (price-only)
+python -m src.models.train --intervals 1d --onchain # price + on-chain
+
+# Step 4: evaluate
+python -m src.models.evaluate --intervals 1d
+python -m src.models.evaluate --intervals 1d --pruned
+python -m src.models.evaluate --intervals 1d --onchain
+```
+
+### 3-way comparison (BTCUSDT 1d, horizon 1)
+
+Same split as Phase 4/5: train 1,557 rows (2020-01-31 → 2024-08-16), val 329 rows, test 328 rows (2025-08-17 → 2026-08-10).
+
+| Variant | Model | Val accuracy | Val edge | Test accuracy | Test edge |
+| --- | --- | --- | --- | --- | --- |
+| base | LR | 52.9% | −0.3pp | 45.4% | −6.7pp |
+| base | LGB | 53.2% | +0.0pp | 47.9% | −4.3pp |
+| pruned | LR | 53.5% | +0.3pp | 45.4% | −6.7pp |
+| pruned | LGB | 53.2% | +0.0pp | 47.9% | −4.3pp |
+| **onchain** | **LR** | **53.8%** | **+0.6pp** | **47.0%** | **−5.2pp** |
+| **onchain** | **LGB** | **53.8%** | **+0.6pp** | **47.6%** | **−4.6pp** |
+
+No leak alert fired (all well below the 65% tripwire).
+
+### Honest verdict
+
+On-chain features produce a **marginal but not material** improvement.  At daily resolution:
+
+- Validation: the on-chain variant gains +0.3–0.6pp on both models vs pruned price-only.  This is within noise.
+- Test: on-chain LR is +1.6pp over pruned LR, LGB is +0.3pp.  No consistent win.
+- LightGBM early-stopping selected 13 trees for the on-chain model vs 1 tree for base/pruned — it found slightly more learnable signal, but the resulting accuracy gain is not robust across val/test.
+
+**Why**: at daily granularity, the free on-chain metrics (active addresses, hash rate, fees, volume) trend together with price — their z-scores and WoW changes carry correlated directional information to the price features already present.  The on-chain metrics historically most useful for regime detection (exchange netflows, realized-price deviation, STH/LTH ratio) require paid services that were not used.
+
+**Conclusion**: free on-chain data is neither harmful nor transformative here.  The result is neutral, which is the honest finding.  Including the features does not hurt the pipeline and is kept in the feature table for any future experiment that explores non-daily resolution or longer horizons.
+
+See `notebooks/06_onchain_analysis.ipynb` for metric time-series plots, correlation with the label, LightGBM feature importances by category (on-chain vs price), and the full 3-way comparison table.
 
 ## Tests and lint
 

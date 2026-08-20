@@ -84,3 +84,24 @@ backtest:
   fee_rate: 0.001        # Binance taker fee: 0.1% per side (standard VIP-0 spot rate)
   slippage_rate: 0.001   # conservative market-impact estimate: 0.1% per side
   starting_notional: 10000.0  # USD notional at start of test window
+
+# On-chain Bitcoin data settings (Phase 6).
+# Source: Blockchain.com Charts API — free, no auth required.
+# NOT available for free: exchange netflows, whale movement, HODL waves,
+# realized price, NUPL — these require Glassnode or CryptoQuant (paid).
+onchain:
+  metrics:
+    active_addresses: "n-unique-addresses"      # unique sending/receiving addresses per day
+    n_transactions:   "n-transactions"           # confirmed transactions per day
+    hash_rate_th:     "hash-rate"               # estimated hash rate (TH/s)
+    fees_usd:         "transaction-fees-usd"     # total miner fees paid in USD
+    volume_usd:       "estimated-transaction-volume-usd"  # estimated transferred USD value
+  reporting_lag_days: 1   # use T-1 on-chain data for candle T (conservative; fully final by midnight)
+  z_score_windows: [7, 30]  # rolling z-score windows in days
+  wow_window: 7            # week-over-week % change window in days
+  max_forward_fill_days: 3 # fill up to 3-day API publication gaps
+  base_url: "https://api.blockchain.info/charts"
+  timespan: "7years"
+  request_timeout_s: 30
+  max_retries: 3
+  backoff_base_s: 1.0
