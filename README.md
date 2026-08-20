@@ -35,6 +35,9 @@ strategy equity curves, comparison vs buy-and-hold, and an honest verdict.
 (free, no auth) — 5 metrics × 3 transformations = 15 features added to the
 pipeline, with a 1-day conservative lag, no-lookahead validation, and a 3-way
 comparison against price-only models.
+**Phase 7 (done):** multi-regime backtesting across 5 historical BTC windows
+(COVID crash, 2020-21 bull, 2022 bear, 2023 recovery, Phase 5 OOS test) with
+explicit in-sample / out-of-sample labeling committed before running any backtest.
 
 ## Repository layout
 
@@ -52,6 +55,7 @@ src/models/evaluate.py            # accuracy vs base rate, importances, gating, 
 src/backtest/simulate.py          # day-by-day equity simulation with per-side fees + slippage
 src/backtest/baseline.py          # buy-and-hold baseline (1 entry + 1 exit fee)
 src/backtest/report.py            # comparison table + CLI for Phase 5
+src/backtest/multi_regime.py      # Phase 7: 5-regime backtest with IS/OOS labeling
 src/data/fetch_onchain.py         # Blockchain.com Charts API fetcher (Phase 6, free)
 src/features/onchain.py           # on-chain feature engineering: lag + z-scores + WoW
 tests/                            # unit tests incl. leakage + deliberate-leak + alignment
@@ -62,6 +66,7 @@ notebooks/04_model_evaluation.ipynb # Phase 4: probability dist, confusion matri
                                    #   accuracy-by-confidence-bucket
 notebooks/05_backtest_results.ipynb # Phase 5: equity curves, drawdown, comparison table
 notebooks/06_onchain_analysis.ipynb # Phase 6: on-chain metrics vs price, 3-way comparison
+notebooks/07_multi_regime.ipynb   # Phase 7: small-multiple equity curves, IS/OOS table
 data/raw/                         # candles: parquet + CSV + manifest (git-ignored)
 data/processed/                   # feature / label tables + manifests (git-ignored)
 models/                           # trained artifacts + training manifest (git-ignored)
@@ -474,6 +479,73 @@ On-chain features produce a **marginal but not material** improvement.  At daily
 **Conclusion**: free on-chain data is neither harmful nor transformative here.  The result is neutral, which is the honest finding.  Including the features does not hurt the pipeline and is kept in the feature table for any future experiment that explores non-daily resolution or longer horizons.
 
 See `notebooks/06_onchain_analysis.ipynb` for metric time-series plots, correlation with the label, LightGBM feature importances by category (on-chain vs price), and the full 3-way comparison table.
+
+## Multi-regime backtesting (Phase 7)
+
+### Methodology
+
+Five historical BTC windows were committed **before running any backtest** to prevent
+post-hoc cherry-picking.  Windows were chosen from publicly documented BTC market
+history.  The in-sample flag is set mechanically — any window overlapping the
+training period `[2020-01-01, 2024-08-16]` is labelled IN-SAMPLE.
+
+**Critical distinction:**
+- **IN-SAMPLE (IS):** the pruned model was trained on this data. Results are
+  diagnostic only — good IS performance is expected from a model that memorised the
+  training distribution, not evidence of predictive skill.
+- **OUT-OF-SAMPLE (OOS):** model never saw this data during training or early
+  stopping. This is the only window where performance carries meaning.
+
+### Regime comparison table (BTCUSDT 1d, pruned model)
+
+| Regime | IS/OOS | Days | LR return | LGB return | B&H return | LR Sharpe | LR trades |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| COVID crash (Feb-Apr 2020) | **IS** | 90 | **+116.3%** | 0.0% | −6.3% | 3.10 | 28 |
+| 2020-2021 bull run | **IS** | 212 | +6.5% | 0.0% | **+442.1%** | 0.39 | 37 |
+| 2022 bear market | **IS** | 365 | +14.0% | 0.0% | −65.3% | 0.48 | 85 |
+| 2023 recovery | **IS** | 365 | +17.8% | 0.0% | +164.8% | 0.74 | 76 |
+| **Phase 5 test window** | **OOS** | 360 | **−46.8%** | **0.0%** | **−46.0%** | **−1.80** | **70** |
+
+LGB fires **zero signals in every window** (IS and OOS alike) at the 0.60 confidence
+threshold.  This is not a regime-dependent outcome — the model simply never exceeds
+the threshold in either direction regardless of market conditions.
+
+### Honest verdict
+
+The only result that counts is the out-of-sample window.  LR returned **−46.8%** vs
+buy-and-hold **−46.0%** — essentially the same outcome, with 70 round-trips generating
+roughly 14 percentage points of fee drag that the model had to overcome just to match
+buy-and-hold.  It didn't.
+
+The in-sample results are instructive about what this model has memorised:
+
+- **Bear regimes (COVID crash, 2022):** LR substantially outperforms B&H in both
+  windows.  This reflects a model that learned to go short or go cash when its
+  in-sample training data showed prices falling.  It is what overfitting to bear
+  conditions looks like.
+- **Bull regimes (2020-21 bull, 2023 recovery):** LR severely underperforms B&H
+  (+6.5% vs +442%, +18% vs +165%).  The same conservatism that avoids bear drawdowns
+  causes it to miss sustained uptrends almost entirely.
+- **The OOS window (the falling BTC of 2025-26):** even in a bear regime that
+  superficially resembles the 2022 period the model was trained on, LR fails to
+  replicate the IS bear-market result.  It takes nearly as much damage as buy-and-hold
+  (−46.8% vs −46.0%) while paying fees on 70 trades.
+
+**Conclusion:** phase 7 confirms phase 5's finding by adding historical context.  The
+model has no demonstrated directional edge.  IS bear-market results are a function of
+memorisation, not predictive ability — the OOS result is the honest signal, and it is
+flat-to-negative vs buy-and-hold after fees.  No model variant should be used for
+live trading.
+
+### Running Phase 7
+
+```bash
+python -m src.backtest.multi_regime
+python -m src.backtest.multi_regime --log-level DEBUG
+```
+
+See `notebooks/07_multi_regime.ipynb` for equity curves (small multiples, IS regimes
+visually distinguished from OOS) and the formatted comparison table.
 
 ## Tests and lint
 
