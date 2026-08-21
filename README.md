@@ -113,6 +113,21 @@ Good IS performance is expected from memorisation, not evidence of skill.
 
 **The OOS result is flat vs buy-and-hold after fees. No edge.**
 
+### Live forward-test (ongoing, leakage-immune)
+
+Every backtest in this project, however carefully split, is still a
+retrospective evaluation of a frozen model on historical data. To close that gap,
+the project records its daily signal to a permanent, append-only log
+(`data/signal_log/live_signals.csv`) via `python -m src.monitor.record_signal`
+**before** the predicted move happens. Because a signal cannot be tuned to an
+outcome that does not exist yet, the accuracy computed from this log is
+out-of-sample **by construction** — the strongest form of honesty available.
+
+The dashboard surfaces this as a *"Live forward-test accuracy"* section, shown
+only after 20 days have accumulated and kept strictly separate from the backtest
+numbers above. Setup is a one-time scheduling step documented in
+[MONITORING.md](MONITORING.md).
+
 ---
 
 ## What I'd trust vs not trust
@@ -122,6 +137,8 @@ Good IS performance is expected from memorisation, not evidence of skill.
   cherry-picking of the test window.
 - The walk-forward split and leakage-prevention machinery — independently
   tested, deliberate-leak test included.
+- The **live forward-test** (once it has accumulated enough days) — signals
+  logged before their outcomes existed cannot be inflated by hindsight.
 - The conclusion: no demonstrated edge on BTC daily data with this feature set.
 
 **Do not trust:**
@@ -166,6 +183,9 @@ python -m src.backtest.multi_regime
 
 # 5. Launch dashboard
 streamlit run src/dashboard/app.py
+
+# 6. (Optional) record today's signal for the live forward-test log
+python -m src.monitor.record_signal        # schedule daily — see MONITORING.md
 ```
 
 ### Tests and lint
@@ -187,8 +207,8 @@ Both run in CI on every push and pull request (`.github/workflows/ci.yml`).
 | Features | `TA-Lib`, `pandas` | candlestick patterns, rolling indicators |
 | Modeling | `scikit-learn`, `lightgbm` | logistic regression, gradient boosting |
 | Backtest | custom (`src/backtest/`) | per-day equity simulation with fee accounting |
-| Dashboard | `streamlit` | live signal display |
-| Tests | `pytest` | 269 unit tests |
+| Dashboard | `streamlit`, `plotly` | live signal display + candlestick chart |
+| Tests | `pytest` | 310 unit tests |
 | Lint | `ruff` | enforced in CI |
 
 ---
@@ -220,15 +240,23 @@ src/
     multi_regime.py               # 5-regime backtest with IS/OOS labeling (Phase 7)
   dashboard/
     signals.py                    # live signal computation
+    chart.py                      # candlestick + hindsight-coloured markers
+    alerts.py                     # non-silent signal banners + browser notifications
+    freshness.py                  # staleness check + validated retrain-and-promote
+    live_track_record.py          # leakage-immune live forward-test accuracy
     app.py                        # Streamlit dashboard
-tests/                            # 269 unit tests
+  monitor/
+    record_signal.py              # standalone daily signal recorder (append-only log)
+tests/                            # 310 unit tests
 notebooks/
   01–07_*.ipynb                   # visualisation and reporting notebooks
 data/raw/                         # candles + manifests (git-ignored)
 data/processed/                   # features + labels (git-ignored)
+data/signal_log/                  # live signal log + retrain audit (append-only)
 models/                           # trained artifacts (git-ignored)
 PHASES.md                         # detailed phase-by-phase notes
 DASHBOARD.md                      # dashboard run instructions
+MONITORING.md                     # daily signal-logging setup (forward-test)
 ```
 
 For the complete phase-by-phase methodology, data, and evaluation details,
