@@ -198,3 +198,109 @@ class TestSignalResultContract:
 
     def test_ret_std_30_positive(self, fake_result):
         assert fake_result["ret_std_30"] > 0
+
+
+# ── Alerts: accuracy context is mandatory (Phase 9) ───────────────────────
+
+class TestAlerts:
+    def test_buy_alert_includes_accuracy_context(self):
+        from src.dashboard.alerts import build_alert_text
+
+        text = build_alert_text("lr", "BUY", 0.63)
+        assert "BUY" in text
+        assert "historically" in text  # never a bare directional call
+
+    def test_sell_alert_includes_accuracy_context(self):
+        from src.dashboard.alerts import build_alert_text
+
+        text = build_alert_text("lr", "SELL", 0.30)
+        assert "SELL" in text
+        assert "historically" in text
+
+    def test_no_directional_alert_is_ever_bare(self):
+        """Every non-silent alert must cite a hit rate or an explicit caveat."""
+        from src.dashboard.alerts import build_alert_text
+
+        for model in ("lr", "lgb"):
+            for signal, prob in (("BUY", 0.7), ("SELL", 0.25)):
+                text = build_alert_text(model, signal, prob)
+                assert ("historically" in text) or ("no measured hit rate" in text)
+
+    def test_lgb_alert_flags_absent_track_record(self):
+        from src.dashboard.alerts import build_alert_text
+
+        # LGB win rate is NaN (never fired) — must warn, not fabricate a number.
+        text = build_alert_text("lgb", "BUY", 0.72)
+        assert "no measured hit rate" in text
+
+    def test_silent_signal_produces_no_alert(self):
+        from src.dashboard.alerts import alerts_for_result
+
+        result = {
+            "signal_lr": "SILENT", "signal_lgb": "SILENT",
+            "prob_lr": 0.46, "prob_lgb": 0.52,
+        }
+        assert alerts_for_result(result) == []
+
+    def test_fired_signal_produces_alert(self):
+        from src.dashboard.alerts import alerts_for_result
+
+        result = {
+            "signal_lr": "BUY", "signal_lgb": "SILENT",
+            "prob_lr": 0.63, "prob_lgb": 0.52,
+        }
+        alerts = alerts_for_result(result)
+        assert len(alerts) == 1
+        assert alerts[0]["model"] == "lr"
+        assert "historically" in alerts[0]["text"]
+
+
+# ── Chart: pure figure builder smoke tests (Phase 9) ──────────────────────
+
+class TestChartFigure:
+    @pytest.fixture
+    def ohlc(self):
+        dates = pd.date_range("2026-06-01", periods=5, freq="D", tz="UTC")
+        return pd.DataFrame(
+            {
+                "open_time": dates,
+                "open": [100, 101, 102, 103, 104],
+                "high": [101, 102, 103, 104, 105],
+                "low": [99, 100, 101, 102, 103],
+                "close": [100.5, 101.5, 102.5, 103.5, 104.5],
+            }
+        )
+
+    def test_builds_figure_with_candlestick(self, ohlc):
+        from src.dashboard.chart import build_candlestick_figure
+
+        fig = build_candlestick_figure(ohlc, pd.DataFrame(), None)
+        assert len(fig.data) >= 1  # at least the candlestick trace
+
+    def test_markers_and_badge_add_traces(self, ohlc):
+        from src.dashboard.chart import build_candlestick_figure
+
+        markers = pd.DataFrame(
+            {
+                "date": [pd.Timestamp("2026-06-02", tz="UTC")],
+                "signal": ["BUY"],
+                "price": [101.5],
+                "realized": ["up"],
+                "correct": [True],
+            }
+        )
+        badge = {
+            "date": ohlc["open_time"].iloc[-1],
+            "price": 104.5,
+            "signal": "SILENT",
+            "text": "Today: SILENT",
+        }
+        fig = build_candlestick_figure(ohlc, markers, badge)
+        # candlestick + green markers + today badge
+        assert len(fig.data) >= 3
+        assert len(fig.layout.annotations) == 1
+
+    def test_caption_mentions_retrospective(self):
+        from src.dashboard.chart import chart_caption
+
+        assert "retrospective" in chart_caption().lower()
