@@ -18,3 +18,6 @@ joblib==1.5.3
 
 # Dashboard (Phase 8).
 streamlit==1.62.0
+
+# Dashboard charting + live monitoring (Phase 9).
+plotly==5.24.1

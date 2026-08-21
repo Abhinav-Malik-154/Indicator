@@ -19,3 +19,9 @@ data/processed/*
 # Model artifacts (reproducible via `python -m src.models.train`)
 models/*
 !models/.gitkeep
+
+# Signal-log directory: the CSV records ARE tracked (they are the project's
+# non-reproducible forward-test + retrain-audit trail, recorded before outcomes
+# were known). Only operational/debug output from the scheduled recorder is
+# ignored.
+data/signal_log/*.out
