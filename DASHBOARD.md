@@ -61,17 +61,25 @@ Alerts fire **only while the dashboard tab is open**. For an always-on record
 that does not depend on anyone watching, use the daily recorder in
 `MONITORING.md`.
 
-### Price chart (candlestick + hindsight-coloured markers)
+### Price chart (Binance-style line + hindsight-coloured markers)
 
-A Plotly candlestick of the **last 180 daily candles**. On top of it:
+A Plotly line chart in the Binance house style: a thin gold price line with a
+gradient area fill on a clean dark canvas, faint horizontal gridlines, `$`/`K`
+axis labels, and a dashed **current-price line** with a price tag. A range
+selector (**1M / 3M / 6M / YTD / 1Y**) sits above the chart, and a **Signal
+markers** toggle shows or hides the overlay for a pure price view. On top of the
+line:
 
 - **Green / red markers** on the **out-of-sample test period only**, showing the
   pruned logistic-regression signals coloured by whether the call turned out
   correct N days later (green = right, red = wrong). These are **retrospective**,
   not a live prediction feed. LightGBM fires no signals on this split, so it has
   no markers.
-- A **★ "today" badge** at the last closed candle showing the current live
-  signal. Nothing is ever drawn past the last fully closed candle.
+- A **● "today" dot** at the last closed candle showing the current live signal.
+  Nothing is ever drawn past the last fully closed candle.
+
+The full range (up to 1Y) is fetched once and sliced client-side, so switching
+ranges does not re-hit the network.
 
 ### 1. Current Signal
 
@@ -174,7 +182,7 @@ the difference between test accuracy and win rate, and links to
 src/dashboard/
     __init__.py            # empty package marker
     signals.py             # fetch → features → predict → result dict
-    chart.py               # plotly candlestick + retrospective markers + today badge
+    chart.py               # Binance-style line/area + candlestick, markers, today badge, ranges
     alerts.py              # non-silent → banner + browser notification (with accuracy context)
     freshness.py           # staleness check + validated retrain-and-promote + audit
     live_track_record.py   # leakage-immune forward-test accuracy from the signal log

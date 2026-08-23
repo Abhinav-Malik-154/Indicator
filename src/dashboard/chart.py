@@ -1,6 +1,8 @@
-"""Candlestick chart with retrospective, hindsight-coloured signal markers (Phase 9).
+"""Price chart with retrospective, hindsight-coloured signal markers (Phase 9).
 
-The chart shows the last ~180 daily candles.  On top of it, markers are drawn
+The default view is a Binance-style gold line with a gradient area fill on a
+clean dark canvas (:func:`build_price_figure`); a candlestick view is also
+available (:func:`build_candlestick_figure`).  On top of either, markers are drawn
 **only** on the out-of-sample test split — the same signals the pruned model
 produced in Phase 5 evaluation — and coloured by whether the direction turned
 out correct N days later (green = right, red = wrong).
@@ -35,11 +37,25 @@ from src.dashboard.signals import compute_live_signal, fetch_live_candles
 
 logger = logging.getLogger(__name__)
 
-_MARKER_GREEN = "#2ca02c"
-_MARKER_RED = "#d62728"
-_BADGE_COLOUR = {"BUY": "#2ca02c", "SELL": "#d62728", "SILENT": "#7f7f7f"}
+# ── Binance-style palette ─────────────────────────────────────────────────
+BINANCE_GOLD = "#F0B90B"        # brand gold (fill)
+BINANCE_GOLD_LINE = "#F3BA2F"   # slightly brighter gold for the line
+_UP_GREEN = "#0ecb81"           # Binance green
+_DOWN_RED = "#f6465d"           # Binance red
+_AXIS_TEXT = "#848e9c"          # muted gray axis/label text
+_GRID = "rgba(255,255,255,0.05)"  # near-invisible horizontal gridlines
+_SPIKE = "#5e6673"              # hover crosshair colour
 
-CHART_CANDLES = 180
+_MARKER_GREEN = _UP_GREEN
+_MARKER_RED = _DOWN_RED
+_BADGE_COLOUR = {"BUY": _UP_GREEN, "SELL": _DOWN_RED, "SILENT": _AXIS_TEXT}
+
+CHART_CANDLES = 180             # default candlestick window
+CHART_FETCH_CANDLES = 365       # fetched once, then sliced per selected range
+
+# Selectable time ranges (days back from the last candle); "YTD" is special.
+RANGE_DAYS = {"1M": 30, "3M": 90, "6M": 180, "1Y": 365}
+CHART_RANGES = ["1M", "3M", "6M", "YTD", "1Y"]
 
 
 # ---------------------------------------------------------------------------
@@ -144,109 +160,229 @@ def compute_historical_markers(
 # ---------------------------------------------------------------------------
 
 
+def _add_signal_markers(
+    fig: go.Figure,
+    window_start: Any,
+    markers: pd.DataFrame,
+    *,
+    show: bool = True,
+) -> None:
+    """Overlay retrospective green/red correctness markers within the window."""
+    if not show or markers is None or markers.empty:
+        return
+    visible = markers[markers["date"] >= window_start]
+    for correct, colour in ((True, _MARKER_GREEN), (False, _MARKER_RED)):
+        subset = visible[visible["correct"] == correct]
+        if subset.empty:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=subset["date"], y=subset["price"], mode="markers",
+                marker=dict(
+                    size=8, color=colour,
+                    symbol=[
+                        "triangle-up" if s == "BUY" else "triangle-down"
+                        for s in subset["signal"]
+                    ],
+                    line=dict(width=1, color="#0b0e11"),
+                ),
+                customdata=subset[["signal", "realized"]].to_numpy(),
+                hovertemplate=(
+                    "%{x|%b %d}<br>signal=%{customdata[0]}"
+                    "<br>outcome=%{customdata[1]}<extra></extra>"
+                ),
+                showlegend=False,
+            )
+        )
+
+
+def _add_today_badge(fig: go.Figure, today_badge: dict[str, Any] | None) -> None:
+    """Add the dashed current-price line, the live-signal dot, and its label."""
+    if today_badge is None:
+        return
+    price = float(today_badge["price"])
+    sig = today_badge["signal"]
+    colour = _BADGE_COLOUR.get(sig, _AXIS_TEXT)
+    fig.add_hline(
+        y=price, line_dash="dot", line_color=_SPIKE, line_width=1,
+        annotation_text=f" ${price:,.0f} ", annotation_position="right",
+        annotation_font=dict(color="#eaecef", size=11),
+        annotation_bgcolor="#2b3139",
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[today_badge["date"]], y=[price], mode="markers",
+            marker=dict(size=10, color=colour, symbol="circle",
+                        line=dict(width=2, color="#0b0e11")),
+            hovertext=[today_badge.get("text", f"Today: {sig}")],
+            hoverinfo="text", showlegend=False,
+        )
+    )
+    fig.add_annotation(
+        x=today_badge["date"], y=price, text=f"● Today: {sig}",
+        showarrow=False, xanchor="right", yanchor="bottom", yshift=10,
+        font=dict(color=colour, size=11),
+    )
+
+
+def _apply_dark_layout(fig: go.Figure, x: pd.Series, lo: float, hi: float) -> None:
+    """Apply the shared Binance-style dark theme, grid, axes, and hover crosshair."""
+    fig.update_layout(
+        height=460,
+        margin=dict(l=10, r=70, t=20, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color=_AXIS_TEXT, size=12),
+        hovermode="x unified",
+        showlegend=False,
+        xaxis=dict(
+            showgrid=False, showline=False, zeroline=False, color=_AXIS_TEXT,
+            showspikes=True, spikemode="across", spikethickness=1,
+            spikecolor=_SPIKE, spikedash="dot",
+            range=[x.min(), x.max()],
+            rangeslider=dict(visible=False),
+        ),
+        yaxis=dict(
+            showgrid=True, gridcolor=_GRID, gridwidth=1, showline=False,
+            zeroline=False, color=_AXIS_TEXT, tickprefix="$", tickformat=".3s",
+            range=[lo, hi],
+        ),
+    )
+
+
 def build_candlestick_figure(
     ohlc: pd.DataFrame,
     markers: pd.DataFrame,
     today_badge: dict[str, Any] | None = None,
+    *,
+    show_markers: bool = True,
 ) -> go.Figure:
-    """Assemble the candlestick figure with markers and the today badge.
+    """Assemble a Binance-style candlestick figure with markers and today badge.
+
+    Same clean dark canvas, faint gridlines, dashed current-price line, and
+    live-signal dot as :func:`build_price_figure`, but with green/red OHLC
+    candles instead of the line + gradient area.
 
     Args:
         ohlc: DataFrame with ``open_time``, ``open``, ``high``, ``low``, ``close``.
         markers: Output of :func:`compute_historical_markers` (may be empty).
-        today_badge: Optional dict with ``date``, ``price``, ``signal`` (and
-            optionally ``text``) for the live-signal badge at the last candle.
+        today_badge: Optional dict with ``date``, ``price``, ``signal``, ``text``.
+        show_markers: When ``False``, draw only the candles.
 
     Returns:
         A Plotly :class:`~plotly.graph_objects.Figure`.
     """
     fig = go.Figure()
+    if ohlc.empty:
+        return fig
+
+    x = ohlc["open_time"]
+    lo = float(ohlc["low"].min())
+    hi = float(ohlc["high"].max())
+    pad = (hi - lo) * 0.06 or hi * 0.02
+    lo, hi = lo - pad, hi + pad
+
     fig.add_trace(
         go.Candlestick(
-            x=ohlc["open_time"],
-            open=ohlc["open"],
-            high=ohlc["high"],
-            low=ohlc["low"],
-            close=ohlc["close"],
+            x=x,
+            open=ohlc["open"], high=ohlc["high"],
+            low=ohlc["low"], close=ohlc["close"],
             name="BTC/USDT",
-            increasing_line_color="#26a69a",
-            decreasing_line_color="#ef5350",
+            increasing_line_color=_UP_GREEN, decreasing_line_color=_DOWN_RED,
+            increasing_fillcolor=_UP_GREEN, decreasing_fillcolor=_DOWN_RED,
+            line=dict(width=1),
+            showlegend=False,
+        )
+    )
+    _add_signal_markers(fig, x.min(), markers, show=show_markers)
+    _add_today_badge(fig, today_badge)
+    _apply_dark_layout(fig, x, lo, hi)
+    return fig
+
+
+def slice_by_range(ohlc: pd.DataFrame, range_label: str) -> pd.DataFrame:
+    """Slice an OHLC frame to a selectable time range (Binance-style pills).
+
+    Args:
+        ohlc: DataFrame with an ``open_time`` column, sorted ascending.
+        range_label: One of :data:`CHART_RANGES` (``"1M"``…``"1Y"``, ``"YTD"``).
+
+    Returns:
+        The rows within the requested range (always ends at the last candle).
+    """
+    if ohlc.empty:
+        return ohlc
+    last = pd.Timestamp(ohlc["open_time"].iloc[-1])
+    if range_label == "YTD":
+        start = pd.Timestamp(year=last.year, month=1, day=1, tz=last.tz)
+    else:
+        start = last - pd.Timedelta(days=RANGE_DAYS.get(range_label, 90))
+    return ohlc[ohlc["open_time"] >= start].reset_index(drop=True)
+
+
+def build_price_figure(
+    ohlc: pd.DataFrame,
+    markers: pd.DataFrame,
+    today_badge: dict[str, Any] | None = None,
+    *,
+    show_markers: bool = True,
+) -> go.Figure:
+    """Assemble a Binance-style gold line + gradient-area price figure.
+
+    A thin, crisp gold line (linear — peaks stay sharp) over a vertical gradient
+    fill fading to transparent, on a clean dark canvas with faint horizontal
+    gridlines and a dashed current-price line. The project's retrospective
+    green/red signal markers and the live "today" badge are overlaid on top and
+    can be toggled off for the pure price view.
+
+    Args:
+        ohlc: DataFrame with ``open_time`` and ``close`` (open/high/low ignored).
+        markers: Output of :func:`compute_historical_markers` (may be empty).
+        today_badge: Optional dict with ``date``, ``price``, ``signal``, ``text``.
+        show_markers: When ``False``, draw only the clean price line + area.
+
+    Returns:
+        A Plotly :class:`~plotly.graph_objects.Figure`.
+    """
+    fig = go.Figure()
+    if ohlc.empty:
+        return fig
+
+    x = ohlc["open_time"]
+    y = ohlc["close"].astype(float)
+    ymin, ymax = float(y.min()), float(y.max())
+    pad = (ymax - ymin) * 0.10 or ymax * 0.02
+    lo, hi = ymin - pad, ymax + pad
+
+    # Invisible baseline at the bottom of the visible band so the gradient fills
+    # only the band between the line and the floor (not all the way to zero).
+    fig.add_trace(
+        go.Scatter(
+            x=x, y=[lo] * len(x), mode="lines",
+            line=dict(width=0, color="rgba(0,0,0,0)"),
+            hoverinfo="skip", showlegend=False,
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=x, y=y, mode="lines", name="BTC",
+            line=dict(color=BINANCE_GOLD_LINE, width=2, shape="linear"),
+            fill="tonexty",
+            fillgradient=dict(
+                type="vertical",
+                colorscale=[
+                    [0.0, "rgba(240,185,11,0.0)"],
+                    [1.0, "rgba(240,185,11,0.35)"],
+                ],
+            ),
+            hovertemplate="%{x|%b %d, %Y}<br><b>$%{y:,.0f}</b><extra></extra>",
             showlegend=False,
         )
     )
 
-    if markers is not None and not markers.empty:
-        window_start = ohlc["open_time"].min()
-        visible = markers[markers["date"] >= window_start]
-        for correct, colour, name in (
-            (True, _MARKER_GREEN, "Signal correct (hindsight)"),
-            (False, _MARKER_RED, "Signal wrong (hindsight)"),
-        ):
-            subset = visible[visible["correct"] == correct]
-            if subset.empty:
-                continue
-            fig.add_trace(
-                go.Scatter(
-                    x=subset["date"],
-                    y=subset["price"],
-                    mode="markers",
-                    name=name,
-                    marker=dict(
-                        size=10,
-                        color=colour,
-                        symbol=[
-                            "triangle-up" if s == "BUY" else "triangle-down"
-                            for s in subset["signal"]
-                        ],
-                        line=dict(width=1, color="white"),
-                    ),
-                    customdata=subset[["signal", "realized"]].to_numpy(),
-                    hovertemplate=(
-                        "%{x|%Y-%m-%d}<br>signal=%{customdata[0]}"
-                        "<br>outcome=%{customdata[1]}<br>price=%{y:.0f}<extra></extra>"
-                    ),
-                )
-            )
-
-    if today_badge is not None:
-        sig = today_badge["signal"]
-        colour = _BADGE_COLOUR.get(sig, "#7f7f7f")
-        text = today_badge.get("text", f"Today: {sig}")
-        fig.add_trace(
-            go.Scatter(
-                x=[today_badge["date"]],
-                y=[today_badge["price"]],
-                mode="markers",
-                name="Today (live)",
-                marker=dict(
-                    size=16, color=colour, symbol="star",
-                    line=dict(width=1.5, color="black"),
-                ),
-                hovertext=[text],
-                hoverinfo="text",
-            )
-        )
-        fig.add_annotation(
-            x=today_badge["date"],
-            y=today_badge["price"],
-            text=text,
-            showarrow=True,
-            arrowhead=2,
-            ax=0,
-            ay=-40,
-            bgcolor=colour,
-            font=dict(color="white", size=11),
-            bordercolor="black",
-            borderwidth=1,
-        )
-
-    fig.update_layout(
-        height=460,
-        margin=dict(l=10, r=10, t=30, b=10),
-        xaxis_rangeslider_visible=False,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-        yaxis_title="Price (USDT)",
-    )
+    _add_signal_markers(fig, x.min(), markers, show=show_markers)
+    _add_today_badge(fig, today_badge)
+    _apply_dark_layout(fig, x, lo, hi)
     return fig
 
 
@@ -256,8 +392,8 @@ def chart_caption() -> str:
         "Historical markers are retrospective (test period only) — not a live "
         "prediction feed. Green = the model's call turned out correct N days "
         "later; red = wrong. Markers use the logistic-regression signals "
-        "(LightGBM fires none on this split). The ★ shows today's live signal "
-        "at the last closed candle and makes no claim about the future."
+        "(LightGBM fires none on this split). The ● dot shows today's live "
+        "signal at the last closed candle and makes no claim about the future."
     )
 
 
@@ -266,24 +402,29 @@ def chart_caption() -> str:
 # ---------------------------------------------------------------------------
 
 
-def load_chart_figure(
+def load_chart_data(
     cfg: dict[str, Any],
     *,
     interval: str = "1d",
+    n_candles: int = CHART_FETCH_CANDLES,
     live_result: dict[str, Any] | None = None,
-) -> go.Figure:
-    """Load data and build the full candlestick figure for the dashboard.
+) -> dict[str, Any]:
+    """Fetch the OHLC window, markers, and today badge once for the dashboard.
+
+    Fetching the full range up front lets the UI switch time ranges (1M…1Y)
+    without re-hitting the network — slice the returned ``ohlc`` with
+    :func:`slice_by_range`.
 
     Args:
         cfg: Config dict from :func:`src.models.train.load_modeling_config`.
         interval: Binance interval.
-        live_result: Optional pre-computed :func:`compute_live_signal` result
-            (reused to avoid a second network fetch); computed if omitted.
+        n_candles: How many candles to fetch (covers the widest range).
+        live_result: Optional pre-computed :func:`compute_live_signal` result.
 
     Returns:
-        The assembled Plotly figure.
+        Dict with ``ohlc`` (DataFrame), ``markers`` (DataFrame), ``badge`` (dict).
     """
-    ohlc = load_recent_ohlc(cfg, interval=interval)
+    ohlc = load_recent_ohlc(cfg, interval=interval, n_candles=n_candles)
     try:
         markers = compute_historical_markers(cfg, interval=interval)
     except Exception as exc:  # pragma: no cover - defensive
@@ -301,4 +442,37 @@ def load_chart_figure(
             f"LR {result['signal_lr']} (P={result['prob_lr']:.2f})"
         ),
     }
-    return build_candlestick_figure(ohlc, markers, badge)
+    return {"ohlc": ohlc, "markers": markers, "badge": badge}
+
+
+def load_chart_figure(
+    cfg: dict[str, Any],
+    *,
+    interval: str = "1d",
+    live_result: dict[str, Any] | None = None,
+    range_label: str = "3M",
+    show_markers: bool = True,
+    chart_type: str = "candlestick",
+) -> go.Figure:
+    """Load data and build the price figure for the dashboard.
+
+    Args:
+        cfg: Config dict from :func:`src.models.train.load_modeling_config`.
+        interval: Binance interval.
+        live_result: Optional pre-computed :func:`compute_live_signal` result.
+        range_label: One of :data:`CHART_RANGES`.
+        show_markers: Whether to overlay the retrospective signal markers.
+        chart_type: ``"candlestick"`` (default) or ``"area"`` (Binance line).
+
+    Returns:
+        The assembled Plotly figure.
+    """
+    data = load_chart_data(cfg, interval=interval, live_result=live_result)
+    ohlc = slice_by_range(data["ohlc"], range_label)
+    if chart_type == "area":
+        return build_price_figure(
+            ohlc, data["markers"], data["badge"], show_markers=show_markers
+        )
+    return build_candlestick_figure(
+        ohlc, data["markers"], data["badge"], show_markers=show_markers
+    )

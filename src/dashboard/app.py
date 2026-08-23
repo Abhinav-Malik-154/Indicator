@@ -12,7 +12,14 @@ import pandas as pd
 import streamlit as st
 
 from src.dashboard.alerts import render_alerts
-from src.dashboard.chart import chart_caption, load_chart_figure
+from src.dashboard.chart import (
+    CHART_RANGES,
+    build_candlestick_figure,
+    build_price_figure,
+    chart_caption,
+    load_chart_data,
+    slice_by_range,
+)
 from src.dashboard.freshness import MAX_AGE_HOURS, check_freshness, retrain_with_validation
 from src.dashboard.live_track_record import accumulating_message, load_forward_test
 from src.dashboard.signals import HISTORICAL_ACCURACY, compute_live_signal
@@ -39,8 +46,8 @@ def _load_signal() -> dict:
 
 
 @st.cache_data(ttl=300)
-def _load_chart(_cfg: dict):
-    return load_chart_figure(_cfg, interval=_INTERVAL)
+def _load_chart_data(_cfg: dict) -> dict:
+    return load_chart_data(_cfg, interval=_INTERVAL)
 
 
 @st.cache_data(ttl=300)
@@ -77,7 +84,7 @@ if freshness["is_stale"]:
             "`data/signal_log/retrain_audit.csv`."
         )
         _load_signal.clear()
-        _load_chart.clear()
+        _load_chart_data.clear()
         st.rerun()
 else:
     st.caption(f"🟢 {freshness['message']}")
@@ -103,12 +110,36 @@ render_alerts(result)
 
 st.divider()
 
-# ── Candlestick chart with retrospective, hindsight-coloured markers ──────
-st.subheader("Price chart — last 180 days with hindsight-coloured signals")
-with st.spinner("Building candlestick chart…"):
+# ── Price chart (Binance-style) with retrospective hindsight markers ──────
+st.subheader("BTC/USDT price  ·  hindsight-coloured signals")
+with st.spinner("Loading price data…"):
     try:
-        fig = _load_chart(cfg)
-        st.plotly_chart(fig, width="stretch")
+        chart_data = _load_chart_data(cfg)
+        c1, c2, c3 = st.columns([2, 1.4, 1])
+        range_label = (
+            c1.segmented_control(
+                "Range", CHART_RANGES, default="3M", label_visibility="collapsed",
+            )
+            or "3M"
+        )
+        chart_type = (
+            c2.segmented_control(
+                "Type", ["Candlestick", "Line"], default="Candlestick",
+                label_visibility="collapsed",
+            )
+            or "Candlestick"
+        )
+        show_markers = c3.toggle("Signal markers", value=True)
+        ohlc_slice = slice_by_range(chart_data["ohlc"], range_label)
+        builder = (
+            build_candlestick_figure if chart_type == "Candlestick"
+            else build_price_figure
+        )
+        fig = builder(
+            ohlc_slice, chart_data["markers"], chart_data["badge"],
+            show_markers=show_markers,
+        )
+        st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
     except Exception as exc:  # pragma: no cover - defensive UI guard
         st.error(f"Could not build the chart: {exc}")
 st.caption(chart_caption())
@@ -318,7 +349,7 @@ The OOS test result is flat vs buy-and-hold after fees.
 |---|---|
 | Freshness banner | Flags a model older than {MAX_AGE_HOURS:.0f}h; offers a validated retrain |
 | Signal alert | Banner + browser notification when a model is not silent (with accuracy context) |
-| Price chart | Last 180 candles; test-period markers coloured green/red by hindsight correctness |
+| Price chart | Binance-style line (1M–1Y); test-period markers green/red by hindsight |
 | Current Signal | P(up) from each model; BUY/SELL/SILENT at the {threshold} threshold |
 | Historical Accuracy | Measured OOS backtest performance on {HISTORICAL_ACCURACY["test_period"]} |
 | Live forward-test | Accuracy of signals logged in real time, before outcomes were known |

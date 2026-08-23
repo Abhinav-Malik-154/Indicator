@@ -296,11 +296,112 @@ class TestChartFigure:
             "text": "Today: SILENT",
         }
         fig = build_candlestick_figure(ohlc, markers, badge)
-        # candlestick + green markers + today badge
+        # candlestick + green markers + today dot
         assert len(fig.data) >= 3
-        assert len(fig.layout.annotations) == 1
+        # restyled badge = current-price tag + "● Today" label
+        assert len(fig.layout.annotations) >= 1
+        assert len(fig.layout.shapes) >= 1  # dashed current-price line
 
     def test_caption_mentions_retrospective(self):
         from src.dashboard.chart import chart_caption
 
         assert "retrospective" in chart_caption().lower()
+
+
+# ── Chart: Binance-style area figure + range slicing (Phase 9 polish) ──────
+
+class TestPriceFigure:
+    @pytest.fixture
+    def ohlc(self):
+        dates = pd.date_range("2026-01-01", periods=200, freq="D", tz="UTC")
+        return pd.DataFrame(
+            {
+                "open_time": dates,
+                "open": [100.0 + i for i in range(200)],
+                "high": [101.0 + i for i in range(200)],
+                "low": [99.0 + i for i in range(200)],
+                "close": [100.0 + ((i * 7) % 25) for i in range(200)],
+            }
+        )
+
+    def test_area_figure_has_line_and_gradient_fill(self, ohlc):
+        from src.dashboard.chart import build_price_figure
+
+        fig = build_price_figure(ohlc, pd.DataFrame(), None, show_markers=True)
+        # baseline (invisible) + gold price line
+        assert len(fig.data) >= 2
+        price_trace = fig.data[1]
+        assert price_trace.fill == "tonexty"
+        assert price_trace.fillgradient.type == "vertical"
+
+    def test_empty_ohlc_returns_empty_figure(self):
+        from src.dashboard.chart import build_price_figure
+
+        fig = build_price_figure(pd.DataFrame(), pd.DataFrame(), None)
+        assert len(fig.data) == 0
+
+    def test_show_markers_false_drops_marker_traces(self, ohlc):
+        from src.dashboard.chart import build_price_figure
+
+        markers = pd.DataFrame(
+            {
+                "date": [pd.Timestamp("2026-02-01", tz="UTC")],
+                "signal": ["BUY"],
+                "price": [110.0],
+                "realized": ["up"],
+                "correct": [True],
+            }
+        )
+        with_markers = build_price_figure(ohlc, markers, None, show_markers=True)
+        without = build_price_figure(ohlc, markers, None, show_markers=False)
+        assert len(with_markers.data) > len(without.data)
+
+    def test_yaxis_is_price_formatted(self, ohlc):
+        from src.dashboard.chart import build_price_figure
+
+        fig = build_price_figure(ohlc, pd.DataFrame(), None)
+        assert fig.layout.yaxis.tickprefix == "$"
+
+    def test_today_badge_adds_price_line_and_dot(self, ohlc):
+        from src.dashboard.chart import build_price_figure
+
+        badge = {
+            "date": ohlc["open_time"].iloc[-1],
+            "price": float(ohlc["close"].iloc[-1]),
+            "signal": "SELL",
+            "text": "Today: SELL",
+        }
+        fig = build_price_figure(ohlc, pd.DataFrame(), badge, show_markers=False)
+        # add_hline creates a layout shape; the today dot is a scatter trace
+        assert len(fig.layout.shapes) >= 1
+        assert len(fig.layout.annotations) >= 1
+
+
+class TestSliceByRange:
+    @pytest.fixture
+    def ohlc(self):
+        dates = pd.date_range("2026-01-01", periods=234, freq="D", tz="UTC")
+        return pd.DataFrame({"open_time": dates, "close": range(234)})
+
+    def test_1m_returns_about_a_month(self, ohlc):
+        from src.dashboard.chart import slice_by_range
+
+        assert len(slice_by_range(ohlc, "1M")) == 31  # 30 days back inclusive
+
+    def test_ytd_starts_at_january(self, ohlc):
+        from src.dashboard.chart import slice_by_range
+
+        out = slice_by_range(ohlc, "YTD")
+        assert out["open_time"].iloc[0] == pd.Timestamp("2026-01-01", tz="UTC")
+
+    def test_range_always_ends_at_last_candle(self, ohlc):
+        from src.dashboard.chart import slice_by_range
+
+        for label in ("1M", "3M", "6M", "YTD", "1Y"):
+            out = slice_by_range(ohlc, label)
+            assert out["open_time"].iloc[-1] == ohlc["open_time"].iloc[-1]
+
+    def test_empty_input_returns_empty(self):
+        from src.dashboard.chart import slice_by_range
+
+        assert slice_by_range(pd.DataFrame({"open_time": [], "close": []}), "3M").empty
