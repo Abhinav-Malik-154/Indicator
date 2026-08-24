@@ -132,6 +132,43 @@ def fetch_live_candles(
     return df
 
 
+def fetch_live_price(
+    symbol: str,
+    *,
+    base_url: str = "https://api.binance.com",
+    timeout_s: float = 10.0,
+) -> float:
+    """Fetch the current spot price from the Binance public ticker endpoint.
+
+    This is the *live* last-trade price (the still-forming candle), distinct from
+    the last **closed** candle's close — it is what drives the TradingView-style
+    live price tag on the chart.
+
+    Args:
+        symbol: Trading pair, e.g. ``"BTCUSDT"``.
+        base_url: Override for testing.
+        timeout_s: HTTP request timeout.
+
+    Returns:
+        The current price as a float.
+
+    Raises:
+        requests.RequestException: On network failure.
+        ValueError: If the response is missing a usable price.
+    """
+    resp = requests.get(
+        f"{base_url}/api/v3/ticker/price",
+        params={"symbol": symbol},
+        timeout=timeout_s,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    price = data.get("price") if isinstance(data, dict) else None
+    if price is None:
+        raise ValueError(f"Binance ticker returned no price for {symbol}: {data!r}")
+    return float(price)
+
+
 # ── Feature building ──────────────────────────────────────────────────────
 
 def build_live_features(

@@ -17,12 +17,35 @@ from src.dashboard.chart import (
     build_candlestick_figure,
     build_price_figure,
     chart_caption,
+    compute_expected_band,
     load_chart_data,
     slice_by_range,
 )
 from src.dashboard.freshness import MAX_AGE_HOURS, check_freshness, retrain_with_validation
+from src.dashboard.ledger import build_scorecard, build_signal_ledger
+from src.dashboard.live_predictor import poll_predictor, predictions_table
+from src.dashboard.live_ticker import render_live_badge
 from src.dashboard.live_track_record import accumulating_message, load_forward_test
-from src.dashboard.signals import HISTORICAL_ACCURACY, compute_live_signal
+from src.dashboard.outlook import (
+    DIRECTION_CV,
+    expected_move,
+    fetch_news,
+    predict_volatility_regime,
+    summarize_sentiment,
+)
+from src.dashboard.signals import (
+    HISTORICAL_ACCURACY,
+    compute_live_signal,
+    fetch_live_price,
+)
+from src.dashboard.technical_rating import RATING_STYLE, rate_symbol, to_binance
+from src.dashboard.tradingview import (
+    DEFAULT_INTERVAL_LABEL,
+    DEFAULT_SYMBOL_LABEL,
+    INTERVALS,
+    SYMBOLS,
+    render_tradingview,
+)
 from src.models.train import load_modeling_config
 
 st.set_page_config(
@@ -48,6 +71,162 @@ def _load_signal() -> dict:
 @st.cache_data(ttl=300)
 def _load_chart_data(_cfg: dict) -> dict:
     return load_chart_data(_cfg, interval=_INTERVAL)
+
+
+@st.cache_data(ttl=3600)
+def _load_vol_regime(_cfg: dict) -> dict:
+    return predict_volatility_regime(_cfg, interval=_INTERVAL)
+
+
+@st.cache_data(ttl=900)
+def _load_news() -> list:
+    return fetch_news(limit=6)
+
+
+@st.cache_data(ttl=20)
+def _fresh_live_price(symbol: str) -> float:
+    return fetch_live_price(symbol)
+
+
+@st.fragment(run_every="20s")
+def _render_signals_chart(_cfg: dict) -> None:
+    """Auto-refreshing model candlestick with a live BUY/SELL marker.
+
+    Reruns every ~20s so the live price tag and the directional signal marker
+    move with the market without reloading the whole page.
+    """
+    try:
+        chart_data = _load_chart_data(_cfg)
+        badge = dict(chart_data["badge"])  # copy so we never mutate the cache
+        try:
+            badge["live_price"] = _fresh_live_price(_cfg["symbol"])
+            badge["expected_move"] = compute_expected_band(
+                chart_data["ohlc"], badge["live_price"]
+            )
+        except Exception:  # pragma: no cover - keep cached price on failure
+            pass
+        c1, c2, c3 = st.columns([2, 1.4, 1])
+        range_label = (
+            c1.segmented_control(
+                "Range", CHART_RANGES, default="3M",
+                label_visibility="collapsed", key="sig_range",
+            )
+            or "3M"
+        )
+        chart_type = (
+            c2.segmented_control(
+                "Type", ["Candlestick", "Line"], default="Candlestick",
+                label_visibility="collapsed", key="sig_type",
+            )
+            or "Candlestick"
+        )
+        show_markers = c3.toggle("Signal markers", value=True, key="sig_markers")
+        ohlc_slice = slice_by_range(chart_data["ohlc"], range_label)
+        builder = (
+            build_candlestick_figure if chart_type == "Candlestick"
+            else build_price_figure
+        )
+        fig = builder(ohlc_slice, chart_data["markers"], badge, show_markers=show_markers)
+        st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+    except Exception as exc:  # pragma: no cover - defensive UI guard
+        st.error(f"Could not build the chart: {exc}")
+    st.caption(chart_caption())
+
+
+@st.fragment(run_every="15s")
+def _live_predictor_panel(binance_symbol: str, interval: str) -> None:
+    """Self-scoring next-candle predictor table; advances every ~15s.
+
+    Predictions accumulate in ``st.session_state`` (per symbol+interval) so the
+    table grows and scores itself live as candles close.
+    """
+    key = f"live_preds_{binance_symbol}_{interval}"
+    preds = st.session_state.get(key, {})
+    try:
+        preds = poll_predictor(binance_symbol, interval, preds)
+    except Exception as exc:  # pragma: no cover - network/defensive UI guard
+        st.caption(f"Live predictor unavailable: {exc}")
+        return
+    st.session_state[key] = preds
+
+    table, summ = predictions_table(preds)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Predictions", len(preds))
+    m2.metric("Scored", summ["n_scored"])
+    m3.metric("Correct", summ["n_correct"])
+    m4.metric(
+        "Hit rate",
+        f"{summ['hit_rate']:.0f}%" if summ["hit_rate"] is not None else "—",
+    )
+
+    # Per-direction detail: how the BUY (up) and SELL (down) calls each do.
+    up, dn = summ["by_call"]["UP"], summ["by_call"]["DOWN"]
+
+    def _dir_line(stats: dict) -> str:
+        if stats["hit_rate"] is None:
+            return f"{stats['n_calls']} scored · {stats['n_pending']} pending"
+        return (
+            f"**{stats['hit_rate']:.0f}%** "
+            f"({stats['n_correct']}/{stats['n_calls']}) · "
+            f"{stats['n_pending']} pending"
+        )
+
+    d1, d2 = st.columns(2)
+    d1.metric("▲ Buy (UP) hit rate",
+              f"{up['hit_rate']:.0f}%" if up["hit_rate"] is not None else "—",
+              _dir_line(up))
+    d2.metric("▼ Sell (DOWN) hit rate",
+              f"{dn['hit_rate']:.0f}%" if dn["hit_rate"] is not None else "—",
+              _dir_line(dn))
+
+    if table.empty:
+        st.caption("Warming up… the first call appears on the next refresh.")
+    else:
+        st.dataframe(table, hide_index=True, width="stretch")
+    st.caption(
+        f"Each new {interval} candle, a **two-sided mean-reversion** signal calls "
+        "UP/DOWN **before** it closes (leans DOWN when price is stretched up, UP "
+        "when dipped — so it calls both ways, not just the trend); ✅/❌ is filled "
+        "in once the candle closes. Auto-refreshes ~15s. A rule-based indicator, "
+        "**not** a proven edge — expect the hit rate to settle near ~50%."
+    )
+
+
+@st.fragment(run_every="15s")
+def _live_signal_call(symbol_tv: str, interval_label: str) -> None:
+    """Auto-refreshing BUY/SELL/NEUTRAL call for the selected market + interval.
+
+    Runs every 15s on its own (via ``st.fragment(run_every=...)``) so the signal
+    updates live without rerunning the whole page.
+    """
+    binance_symbol, binance_interval = to_binance(symbol_tv, interval_label)
+    st.markdown(f"**Signal call · {binance_symbol} · {interval_label}**")
+    try:
+        r = rate_symbol(binance_symbol, binance_interval)
+    except Exception as exc:  # pragma: no cover - network/defensive UI guard
+        st.caption(f"Signal call unavailable: {exc}")
+        return
+    colour = RATING_STYLE.get(r["call"], "#848e9c")
+    arrow = "▲" if r["score"] > 0 else ("▼" if r["score"] < 0 else "■")
+    st.markdown(
+        f"<div style='display:inline-block;background:{colour};color:#fff;"
+        f"font-weight:700;font-size:18px;border-radius:6px;padding:6px 16px;'>"
+        f"{arrow} {r['call']}</div>"
+        f"<span style='color:#848e9c;margin-left:10px;'>"
+        f"{r['n_up']}↑ / {r['n_down']}↓ · RSI {r['rsi']:.0f}</span>",
+        unsafe_allow_html=True,
+    )
+    votes = "  ".join(
+        f"{'▲' if v > 0 else ('▼' if v < 0 else '–')} {name}"
+        for name, v in r["votes"].items()
+    )
+    st.caption(votes)
+    st.caption(
+        "Aggregated technical rating (EMA/RSI/MACD/momentum) from live candles — "
+        "same idea as TradingView's gauge. A rule-based indicator, **not** a "
+        "proven-profit signal; short-horizon direction has no measured edge. "
+        "Auto-refreshes ~15s."
+    )
 
 
 @st.cache_data(ttl=300)
@@ -110,39 +289,204 @@ render_alerts(result)
 
 st.divider()
 
-# ── Price chart (Binance-style) with retrospective hindsight markers ──────
-st.subheader("BTC/USDT price  ·  hindsight-coloured signals")
-with st.spinner("Loading price data…"):
+# ── Price charts: live TradingView embed + model-signal candlestick ───────
+st.subheader("BTC price")
+tab_live, tab_signals = st.tabs(["📈 Live (TradingView)", "🎯 Signals (model)"])
+
+with tab_live:
+    lc1, lc2, lc3 = st.columns([2, 1.4, 1])
+    tv_symbol_label = (
+        lc1.selectbox("Market", list(SYMBOLS), index=list(SYMBOLS).index(
+            DEFAULT_SYMBOL_LABEL), label_visibility="collapsed")
+        or DEFAULT_SYMBOL_LABEL
+    )
+    tv_interval_label = (
+        lc2.segmented_control(
+            "Interval", list(INTERVALS), default=DEFAULT_INTERVAL_LABEL,
+            label_visibility="collapsed",
+        )
+        or DEFAULT_INTERVAL_LABEL
+    )
+    tv_dark = lc3.toggle("Dark", value=False)
+    _live_signal_call(SYMBOLS[tv_symbol_label], tv_interval_label)
+    render_tradingview(
+        SYMBOLS[tv_symbol_label],
+        interval=INTERVALS[tv_interval_label],
+        theme="dark" if tv_dark else "light",
+        height=620,
+        key="main",
+    )
+    st.caption(
+        "Live feed streamed by TradingView (no API key). Model buy/sell markers "
+        "live on the **Signals** tab, not on this canvas."
+    )
+
+with tab_signals:
+    _sig_badge = _load_chart_data(cfg)["badge"]
+    head_l, head_r = st.columns([3, 1])
+    head_l.caption(
+        "Hindsight-coloured signals on the model's own daily candlestick, with a "
+        "**live BUY/SELL marker** at the current price (auto-refreshes ~20s). The "
+        "live badge → shows the current price and the countdown to the daily "
+        "candle close (UTC)."
+    )
+    with head_r:
+        render_live_badge(
+            cfg["symbol"], interval=_INTERVAL,
+            prev_close=float(_sig_badge["price"]),
+        )
+    _render_signals_chart(cfg)
+
+st.divider()
+
+# ── Signal ledger + scorecard (when/where the model called BUY/SELL, and hits/misses)
+st.subheader("📋 Signal ledger & scorecard")
+
+_now = "BUY ▲" if result["signal_lr"] == "BUY" else (
+    "SELL ▼" if result["signal_lr"] == "SELL" else "SILENT (no position)"
+)
+st.markdown(
+    f"**Right now ({result['candle_date'].date()}):** LR says **{_now}** "
+    f"· P(up) `{result['prob_lr']:.3f}` · threshold `{result['threshold']}`"
+)
+
+_markers = _load_chart_data(cfg)["markers"]
+led_col, score_col = st.columns([1, 1.4])
+
+with led_col:
+    st.markdown("**When & where — the model's BUY/SELL calls**")
+    ledger = build_signal_ledger(_markers, limit=30)
+    if ledger.empty:
+        st.caption("No directional calls yet (the 0.60 confidence gate hasn't fired).")
+    else:
+        st.dataframe(ledger, hide_index=True, width="stretch")
+    st.caption("Entry = the close on the day the model signalled. Most recent first.")
+
+with score_col:
+    st.markdown("**Right vs wrong — how those calls landed**")
+    score_tbl, summ = build_scorecard(_markers, limit=30)
+    if summ["accuracy_pct"] is None:
+        st.caption("No scored calls yet.")
+    else:
+        s1, s2, s3 = st.columns(3)
+        s1.metric("Correct", summ["n_correct"])
+        s2.metric("Wrong", summ["n_wrong"])
+        s3.metric("Hit rate", f"{summ['accuracy_pct']:.0f}%")
+        st.dataframe(score_tbl, hide_index=True, width="stretch")
+    st.caption(
+        "Outcome = actual move one day later (✅ right / ❌ wrong). These are "
+        "out-of-sample calls on data the model never trained on — an honest track "
+        "record, **not** a promise (measured edge is ≈0)."
+    )
+
+st.divider()
+
+# ── Live next-candle predictor (self-scoring, updates every refresh) ───────
+st.subheader("🔮 Live next-candle predictor  ·  self-scoring")
+st.caption(
+    "Forward-looking: calls the **next** candle before it closes, then scores "
+    "itself when it does — a running, honest track record that updates live."
+)
+pc1, _pc2 = st.columns([1, 3])
+_pred_interval = (
+    pc1.segmented_control(
+        "Predictor interval", ["1m", "5m", "15m"], default="1m",
+        label_visibility="collapsed", key="pred_interval",
+    )
+    or "1m"
+)
+_live_predictor_panel(cfg["symbol"], _pred_interval)
+
+st.divider()
+
+# ── Next-candle outlook (honest: magnitude + vol-regime are real; direction ~50%)
+st.subheader("🔮 Next-candle outlook")
+st.caption(
+    "What's *actually* forecastable before the next daily candle. Magnitude and "
+    "volatility-regime are backtested and real; direction is ≈ a coin flip "
+    "(measured). Not financial advice."
+)
+oc1, oc2, oc3 = st.columns(3)
+
+# Direction — a guardrail, not a signal: P(up) stamped with its precise
+# measured accuracy so an up/down "lean" is never mistaken for knowledge.
+with oc1:
+    st.markdown("**Direction**  ·  _guardrail, not a signal_")
+    lean = "UP ▲" if result["prob_lr"] >= 0.5 else "DOWN ▼"
+    dist_pp = (result["prob_lr"] - 0.5) * 100.0
+    st.metric("P(up) · LR", f"{result['prob_lr']:.1%}", f"{lean}  ({dist_pp:+.1f}pp)")
+    d = DIRECTION_CV
+    st.caption(
+        f"⚠ **Backtested {d['accuracy']:.1%} "
+        f"[{d['ci_low']:.1%}, {d['ci_high']:.1%}]** over {d['n']:,} out-of-sample "
+        f"days (walk-forward CV) · base rate {d['base_rate']:.1%} sits **inside** "
+        f"the CI → **{d['verdict']}** (edge {d['edge_pp']:+.1f}pp)."
+    )
+    st.caption(
+        "So this P(up) is a **lean, not a forecast** — even at 55% the honest read "
+        "is 'basically a coin flip.' Use it to size *down* conviction, never up."
+    )
+
+# Expected move — the legitimate "how much".
+with oc2:
+    st.markdown("**Expected move**")
     try:
-        chart_data = _load_chart_data(cfg)
-        c1, c2, c3 = st.columns([2, 1.4, 1])
-        range_label = (
-            c1.segmented_control(
-                "Range", CHART_RANGES, default="3M", label_visibility="collapsed",
-            )
-            or "3M"
+        _cd = _load_chart_data(cfg)
+        base_price = float(
+            _cd["badge"].get("live_price") or _cd["badge"]["price"]
         )
-        chart_type = (
-            c2.segmented_control(
-                "Type", ["Candlestick", "Line"], default="Candlestick",
-                label_visibility="collapsed",
-            )
-            or "Candlestick"
+        em = expected_move(_cd["ohlc"]["close"].tolist(), base_price)
+        st.metric("Typical ± (1σ)", f"±{em['sigma_pct']:.1f}%",
+                  f"~${em['typical_move_usd']:,.0f}")
+        st.caption(
+            f"~2 candles in 3 close within **${em['low_1sigma']:,.0f} – "
+            f"${em['high_1sigma']:,.0f}** (from {em['window']}-day realized vol)."
         )
-        show_markers = c3.toggle("Signal markers", value=True)
-        ohlc_slice = slice_by_range(chart_data["ohlc"], range_label)
-        builder = (
-            build_candlestick_figure if chart_type == "Candlestick"
-            else build_price_figure
-        )
-        fig = builder(
-            ohlc_slice, chart_data["markers"], chart_data["badge"],
-            show_markers=show_markers,
-        )
-        st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
     except Exception as exc:  # pragma: no cover - defensive UI guard
-        st.error(f"Could not build the chart: {exc}")
-st.caption(chart_caption())
+        st.caption(f"Expected move unavailable: {exc}")
+
+# Volatility regime — the real, significant edge (Task 3).
+with oc3:
+    st.markdown("**Volatility regime**")
+    try:
+        vr = _load_vol_regime(cfg)
+        arrow = "EXPAND ▲" if vr["regime"] == "EXPAND" else "CONTRACT ▼"
+        st.metric("Next window", arrow, f"P(expand)={vr['p_expand']:.0%}")
+        pt, lo, hi = vr["cv_accuracy"]
+        st.caption(
+            f"✓ Backtested **{pt * 100:.0f}%** [{lo * 100:.0f}%, {hi * 100:.0f}%] "
+            f"(walk-forward CV) — a **real** edge. Predicts vol size, not direction."
+        )
+    except Exception as exc:  # pragma: no cover - defensive UI guard
+        st.caption(f"Volatility-regime model unavailable: {exc}")
+
+with st.expander("📰 Today's BTC news  ·  learn what moves BTC", expanded=True):
+    news = _load_news()
+    if not news:
+        st.caption("News feed unavailable right now.")
+    else:
+        tape = summarize_sentiment(news)
+        # Juxtapose the day's headline tone against BTC's actual move so you can
+        # eyeball whether the tape lined up with price — the honest way to learn
+        # what moves BTC (correlation to notice, never a causal claim).
+        _b = _load_chart_data(cfg)["badge"]
+        move_txt = ""
+        if _b.get("live_price"):
+            chg = (_b["live_price"] / _b["price"] - 1.0) * 100.0
+            move_txt = f"  ·  BTC **{chg:+.1f}%** since last close"
+        st.markdown(
+            f"**Today's tape:** {tape['n_bull']}▲ {tape['n_bear']}▼ "
+            f"{tape['n_neutral']}– → net **{tape['label']}**{move_txt}"
+        )
+        for n in news:
+            title = f"[{n['title']}]({n['link']})" if n["link"] else n["title"]
+            meta = f"  ·  _{n['published']}_" if n["published"] else ""
+            st.markdown(f"{n['tag']}  {title}{meta}")
+    st.caption(
+        "BTC-focused headlines from a public RSS feed (Cointelegraph). The ▲/▼/– "
+        "tag is a crude keyword vote and the tape-vs-move line is a **juxtaposition "
+        "to learn from, not a causal claim** — news is context, never a prediction."
+    )
 
 st.divider()
 
