@@ -33,7 +33,11 @@ import plotly.graph_objects as go
 
 from src.backtest.report import build_test_signals
 from src.backtest.simulate import signals_from_proba
-from src.dashboard.signals import compute_live_signal, fetch_live_candles
+from src.dashboard.signals import (
+    compute_live_signal,
+    fetch_live_candles,
+    fetch_live_price,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +229,138 @@ def _add_today_badge(fig: go.Figure, today_badge: dict[str, Any] | None) -> None
     )
 
 
+_LIVE_MARKER = {
+    "BUY": ("triangle-up", _UP_GREEN),
+    "SELL": ("triangle-down", _DOWN_RED),
+}
+
+
+def _add_live_signal_marker(fig: go.Figure, today_badge: dict[str, Any] | None) -> None:
+    """Draw a live directional BUY/SELL arrow at the current price on the last bar.
+
+    The arrow sits at the live price on the most recent candle and points up for
+    a live BUY call, down for SELL, or a neutral square for SILENT — a live
+    marker that moves with price on each refresh.  Skipped if no live price.
+    """
+    if not today_badge:
+        return
+    live = today_badge.get("live_price")
+    if live is None:
+        return
+    call = today_badge.get("signal", "SILENT")
+    symbol, colour = _LIVE_MARKER.get(call, ("square", _AXIS_TEXT))
+    fig.add_trace(
+        go.Scatter(
+            x=[today_badge["date"]], y=[float(live)], mode="markers+text",
+            marker=dict(size=16, color=colour, symbol=symbol,
+                        line=dict(width=1.5, color="#0b0e11")),
+            text=[f"  LIVE {call}"], textposition="middle right",
+            textfont=dict(color=colour, size=12),
+            hovertext=[f"Live {call} @ ${float(live):,.0f}"], hoverinfo="text",
+            showlegend=False,
+        )
+    )
+
+
+def _include_live_price(
+    lo: float, hi: float, today_badge: dict[str, Any] | None, pad: float,
+) -> tuple[float, float]:
+    """Widen the y-band so the live price tag is never clipped off-chart."""
+    live = (today_badge or {}).get("live_price")
+    if live is None:
+        return lo, hi
+    live = float(live)
+    return min(lo, live - pad * 0.5), max(hi, live + pad * 0.5)
+
+
+def compute_expected_band(
+    ohlc: pd.DataFrame, base_price: float, *, window: int = 20,
+) -> dict[str, Any] | None:
+    """Project the next candle's ±1σ expected-move band from realized volatility.
+
+    Args:
+        ohlc: OHLC frame with ``open_time`` and ``close`` (chronological).
+        base_price: Price to centre the band on (live price or last close).
+        window: Lookback for the volatility estimate.
+
+    Returns:
+        Dict with ``low`` / ``high`` (1σ price band), ``sigma_pct`` and ``next_x``
+        (the projected next-candle timestamp), or ``None`` if it can't be built.
+    """
+    from src.dashboard.outlook import expected_move
+
+    if ohlc is None or ohlc.empty or len(ohlc) < 3:
+        return None
+    try:
+        em = expected_move(ohlc["close"].tolist(), base_price, window=window)
+    except Exception:  # pragma: no cover - defensive
+        return None
+    ot = ohlc["open_time"]
+    step = ot.diff().median()
+    if pd.isna(step):
+        return None
+    return {
+        "low": em["low_1sigma"], "high": em["high_1sigma"],
+        "sigma_pct": em["sigma_pct"], "next_x": ot.iloc[-1] + step,
+    }
+
+
+def _include_expected_band(
+    lo: float, hi: float, x: pd.Series, today_badge: dict[str, Any] | None, pad: float,
+) -> tuple[float, float, Any]:
+    """Widen y and extend x so the projected expected-move band is fully visible."""
+    em = (today_badge or {}).get("expected_move")
+    if not em:
+        return lo, hi, None
+    lo = min(lo, float(em["low"]) - pad * 0.3)
+    hi = max(hi, float(em["high"]) + pad * 0.3)
+    return lo, hi, max(x.max(), em["next_x"])
+
+
+def _add_expected_move_band(fig: go.Figure, today_badge: dict[str, Any] | None) -> None:
+    """Shade the next candle's ±1σ expected-move range to the right of the last bar."""
+    if not today_badge:
+        return
+    em = today_badge.get("expected_move")
+    if not em:
+        return
+    fig.add_shape(
+        type="rect", xref="x", yref="y", layer="below",
+        x0=today_badge["date"], x1=em["next_x"],
+        y0=float(em["low"]), y1=float(em["high"]),
+        fillcolor="rgba(240,185,11,0.12)", line=dict(width=0),
+    )
+    fig.add_annotation(
+        x=em["next_x"], y=float(em["high"]), text=f"±{em['sigma_pct']:.1f}% next",
+        showarrow=False, xanchor="right", yanchor="bottom",
+        font=dict(color=BINANCE_GOLD_LINE, size=11),
+    )
+
+
+def _add_live_price_tag(fig: go.Figure, today_badge: dict[str, Any] | None) -> None:
+    """Draw a TradingView-style live price tag pinned to the right axis.
+
+    A thin dashed line spans the chart at the current *live* spot price with a
+    filled coloured label on the right edge — green when the live price is at or
+    above the last closed candle, red when below — mirroring TradingView's
+    highlighted live-price box.  Silently skips if no live price is available.
+    """
+    if not today_badge:
+        return
+    live = today_badge.get("live_price")
+    if live is None:
+        return
+    live = float(live)
+    prev_close = float(today_badge.get("price", live))
+    colour = _UP_GREEN if live >= prev_close else _DOWN_RED
+    fig.add_hline(
+        y=live, line_dash="dash", line_color=colour, line_width=1,
+        annotation_text=f"<b>${live:,.0f}</b>", annotation_position="right",
+        annotation_font=dict(color="#ffffff", size=12),
+        annotation_bgcolor=colour, annotation_borderpad=3,
+    )
+
+
 def _apply_dark_layout(fig: go.Figure, x: pd.Series, lo: float, hi: float) -> None:
     """Apply the shared Binance-style dark theme, grid, axes, and hover crosshair."""
     fig.update_layout(
@@ -281,6 +417,8 @@ def build_candlestick_figure(
     hi = float(ohlc["high"].max())
     pad = (hi - lo) * 0.06 or hi * 0.02
     lo, hi = lo - pad, hi + pad
+    lo, hi = _include_live_price(lo, hi, today_badge, pad)
+    lo, hi, x_hi = _include_expected_band(lo, hi, x, today_badge, pad)
 
     fig.add_trace(
         go.Candlestick(
@@ -294,9 +432,14 @@ def build_candlestick_figure(
             showlegend=False,
         )
     )
+    _add_expected_move_band(fig, today_badge)
     _add_signal_markers(fig, x.min(), markers, show=show_markers)
     _add_today_badge(fig, today_badge)
+    _add_live_price_tag(fig, today_badge)
+    _add_live_signal_marker(fig, today_badge)
     _apply_dark_layout(fig, x, lo, hi)
+    if x_hi is not None:
+        fig.update_xaxes(range=[x.min(), x_hi])
     return fig
 
 
@@ -353,6 +496,8 @@ def build_price_figure(
     ymin, ymax = float(y.min()), float(y.max())
     pad = (ymax - ymin) * 0.10 or ymax * 0.02
     lo, hi = ymin - pad, ymax + pad
+    lo, hi = _include_live_price(lo, hi, today_badge, pad)
+    lo, hi, x_hi = _include_expected_band(lo, hi, x, today_badge, pad)
 
     # Invisible baseline at the bottom of the visible band so the gradient fills
     # only the band between the line and the floor (not all the way to zero).
@@ -380,9 +525,14 @@ def build_price_figure(
         )
     )
 
+    _add_expected_move_band(fig, today_badge)
     _add_signal_markers(fig, x.min(), markers, show=show_markers)
     _add_today_badge(fig, today_badge)
+    _add_live_price_tag(fig, today_badge)
+    _add_live_signal_marker(fig, today_badge)
     _apply_dark_layout(fig, x, lo, hi)
+    if x_hi is not None:
+        fig.update_xaxes(range=[x.min(), x_hi])
     return fig
 
 
@@ -433,15 +583,24 @@ def load_chart_data(
 
     result = live_result or compute_live_signal(interval=interval)
     last = ohlc.iloc[-1]
+    try:
+        live_price = fetch_live_price(cfg["symbol"])
+    except Exception as exc:  # pragma: no cover - network fallback
+        logger.warning("chart: live price fetch failed (%s); tag omitted", exc)
+        live_price = None
     badge = {
         "date": last["open_time"],
         "price": float(last["close"]),
+        "live_price": live_price,
         "signal": result["signal_lr"],
         "text": (
             f"Today {pd.Timestamp(result['candle_date']).date()}: "
             f"LR {result['signal_lr']} (P={result['prob_lr']:.2f})"
         ),
     }
+    badge["expected_move"] = compute_expected_band(
+        ohlc, live_price if live_price is not None else float(last["close"])
+    )
     return {"ohlc": ohlc, "markers": markers, "badge": badge}
 
 
