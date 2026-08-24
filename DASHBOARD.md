@@ -61,7 +61,28 @@ Alerts fire **only while the dashboard tab is open**. For an always-on record
 that does not depend on anyone watching, use the daily recorder in
 `MONITORING.md`.
 
-### Price chart (Binance-style line + hindsight-coloured markers)
+### Price charts — two tabs
+
+The price section is split into two tabs:
+
+- **📈 Live (TradingView)** — the real TradingView Advanced Chart widget embedded
+  live (no API key). A genuinely streaming candlestick chart with volume, an OHLC
+  readout and the full timeframe toolbar, exactly like tradingview.com. Controls
+  above it pick the **market** (BTC/USDT Binance by default, plus BTC/USD and
+  ETH/USDT), the **interval** (1m → 1W), and a **light/dark** theme. Because it is
+  TradingView's own canvas, the model's signal markers are **not** drawn here —
+  they live on the Signals tab.
+  Above the chart is a **live signal call** (`src/dashboard/technical_rating.py`):
+  a STRONG BUY → STRONG SELL rating for the selected market + interval, aggregated
+  from live Binance candles (EMA 10/30, price-vs-SMA50, RSI(14), MACD, momentum) —
+  the same idea as TradingView's Buy/Sell gauge. It **auto-refreshes every ~15s**
+  via `st.fragment(run_every=...)` so it updates without reloading the page. It is
+  a transparent rule-based indicator, explicitly **not** a proven-profit signal
+  (short-horizon direction has no measured edge).
+- **🎯 Signals (model)** — the model's own daily candlestick with the
+  hindsight-coloured signal overlays (described below).
+
+### Signals tab (Binance-style + hindsight-coloured markers)
 
 A Plotly line chart in the Binance house style: a thin gold price line with a
 gradient area fill on a clean dark canvas, faint horizontal gridlines, `$`/`K`
@@ -75,11 +96,76 @@ line:
   correct N days later (green = right, red = wrong). These are **retrospective**,
   not a live prediction feed. LightGBM fires no signals on this split, so it has
   no markers.
-- A **● "today" dot** at the last closed candle showing the current live signal.
-  Nothing is ever drawn past the last fully closed candle.
+- A **● "today" dot** at the last closed candle showing the current live signal,
+  plus a **live BUY/SELL arrow** at the current price that moves each refresh.
+- A **projected expected-move band** — a shaded ±1σ range drawn one candle into
+  the future (from recent realized volatility), labelled e.g. `±1.8% next`. It
+  shows the *magnitude* the next candle is likely to stay within — the honest
+  "how much", the only genuinely forecastable part of the next bar. The same
+  number appears in the 🔮 Next-candle outlook panel.
 
 The full range (up to 1Y) is fetched once and sliced client-side, so switching
 ranges does not re-hit the network.
+
+### 📋 Signal ledger & scorecard
+
+Two tables (`src/dashboard/ledger.py`), built from the pruned model's actual
+out-of-sample BUY/SELL calls (data it never trained on):
+
+- **When & where** — every directional call with its date and the entry price
+  (the close on the day it signalled), most recent first. Answers "when/where did
+  the model say act."
+- **Right vs wrong** — the same calls with the realized move one day later and a
+  ✅/❌, above a Correct / Wrong / Hit-rate tally. An honest track record, **not**
+  a promise — the measured hit rate here is ~38% (below the base rate), consistent
+  with the project's finding of no directional edge.
+
+A "Right now" line above the tables shows today's live call (usually SILENT — the
+0.60 confidence gate rarely fires). Going forward, live daily calls are also
+appended to `data/signal_log/live_signals.csv` and scored in the leakage-immune
+**Live forward-test** section below.
+
+### 🔮 Live next-candle predictor (self-scoring)
+
+Forward-looking companion to the scorecard (`src/dashboard/live_predictor.py`).
+Every ~15s it calls the **next** short-interval candle (1m / 5m / 15m) UP/DOWN
+*before it closes*, then fills in ✅/❌ the moment that candle closes — a running,
+honest track record that grows while you watch. Predictions accumulate in
+Streamlit session state (per symbol+interval) and a live Hit-rate metric sits
+above the table.
+
+The call comes from a **two-sided mean-reversion** signal (`next_candle_signal`),
+*not* the trend-following Live-tab gauge: it leans **DOWN when price is stretched
+above** its short EMA / overbought and **UP when dipped** / oversold, plus a
+bid-ask-bounce term. This is deliberate — the trend gauge only ever said "UP" in
+an uptrend (it could never detect a down candle); the mean-reversion signal calls
+both directions. It is still a rule-based indicator, **not** a proven edge: on
+noisy 1m bars the hit rate settles near ~50%, and the table shows that live rather
+than hiding it.
+
+### 🔮 Next-candle outlook (honest — no crystal ball)
+
+A four-part outlook for the next daily candle that only surfaces what is
+*actually* forecastable, each labelled with its real accuracy (`src/dashboard/
+outlook.py`):
+
+- **Direction** — the model's `P(up)`, shown **with** its measured out-of-sample
+  accuracy (≈50%, base rate inside the CI). It is explicitly framed as a
+  coin-flip lean with **no proven edge** — never a forecast.
+- **Expected move** — the legitimate "how much": the next candle's typical size
+  from recent realized volatility (per-candle σ), as a `±%`, a `~$` move, and a
+  1σ price band (~2 candles in 3 close inside it). Magnitude *is* predictable
+  even when direction is not.
+- **Volatility regime** — Task 3's real, statistically-significant edge: the
+  volatility-direction logistic model predicts whether the next window will
+  **expand or contract**, backtested at **69% [66.6%, 71.9%]** (walk-forward CV).
+  It predicts vol *size*, not price direction.
+- **Today's BTC news** — recent **Bitcoin-focused** headlines from a free public
+  RSS feed (Cointelegraph's bitcoin tag, no API key), each with a crude keyword
+  bull/bear/neutral tag. A **"today's tape" line** tallies the net sentiment and
+  juxtaposes it against BTC's actual move since the last close — a way to *learn
+  what moves BTC* by eyeballing whether the tape lined up with price. It is a
+  juxtaposition to learn from, explicitly **not** a causal claim or prediction.
 
 ### 1. Current Signal
 
@@ -183,6 +269,12 @@ src/dashboard/
     __init__.py            # empty package marker
     signals.py             # fetch → features → predict → result dict
     chart.py               # Binance-style line/area + candlestick, markers, today badge, ranges
+    tradingview.py         # live TradingView Advanced Chart embed (the 'Live' tab)
+    live_ticker.py         # TradingView-style live price + candle-close countdown badge
+    technical_rating.py    # live BUY/SELL/NEUTRAL gauge (EMA/RSI/MACD/momentum) for the Live tab
+    ledger.py              # signal-ledger + prediction-scorecard tables (when/where + right/wrong)
+    live_predictor.py      # self-scoring next-candle predictor table (calls, then ✅/❌ live)
+    outlook.py             # next-candle outlook: expected move, vol-regime (69%), news feed
     alerts.py              # non-silent → banner + browser notification (with accuracy context)
     freshness.py           # staleness check + validated retrain-and-promote + audit
     live_track_record.py   # leakage-immune forward-test accuracy from the signal log

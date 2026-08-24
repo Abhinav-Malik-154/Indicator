@@ -377,6 +377,170 @@ class TestPriceFigure:
         assert len(fig.layout.annotations) >= 1
 
 
+# ── Chart: TradingView-style live price tag ───────────────────────────────
+
+class TestLivePriceTag:
+    @pytest.fixture
+    def ohlc(self):
+        dates = pd.date_range("2026-06-01", periods=5, freq="D", tz="UTC")
+        return pd.DataFrame(
+            {
+                "open_time": dates,
+                "open": [100, 101, 102, 103, 104],
+                "high": [101, 102, 103, 104, 105],
+                "low": [99, 100, 101, 102, 103],
+                "close": [100.5, 101.5, 102.5, 103.5, 104.5],
+            }
+        )
+
+    def _tag_annotation(self, fig, needle):
+        return [a for a in fig.layout.annotations if needle in (a.text or "")]
+
+    def test_live_tag_drawn_when_price_present(self, ohlc):
+        from src.dashboard.chart import _DOWN_RED, _UP_GREEN, build_candlestick_figure
+
+        badge = {"date": ohlc["open_time"].iloc[-1], "price": 104.5,
+                 "live_price": 108.0, "signal": "SILENT", "text": "x"}
+        fig = build_candlestick_figure(ohlc, pd.DataFrame(), badge)
+        tag = self._tag_annotation(fig, "108")
+        assert tag, "live price tag annotation missing"
+        # Live above last close → green tag.
+        assert tag[0].bgcolor == _UP_GREEN != _DOWN_RED
+
+    def test_live_tag_red_when_below_last_close(self, ohlc):
+        from src.dashboard.chart import _DOWN_RED, build_price_figure
+
+        badge = {"date": ohlc["open_time"].iloc[-1], "price": 104.5,
+                 "live_price": 101.0, "signal": "SILENT", "text": "x"}
+        fig = build_price_figure(ohlc, pd.DataFrame(), badge, show_markers=False)
+        tag = self._tag_annotation(fig, "101")
+        assert tag and tag[0].bgcolor == _DOWN_RED
+
+    def test_no_tag_without_live_price(self, ohlc):
+        from src.dashboard.chart import build_candlestick_figure
+
+        badge = {"date": ohlc["open_time"].iloc[-1], "price": 104.5,
+                 "signal": "SILENT", "text": "x"}  # no live_price key
+        fig = build_candlestick_figure(ohlc, pd.DataFrame(), badge)
+        # only the today-badge $tag may exist; no bold live tag
+        assert not [a for a in fig.layout.annotations if "<b>$" in (a.text or "")]
+
+    def test_yaxis_widens_to_include_live_price(self, ohlc):
+        from src.dashboard.chart import build_candlestick_figure
+
+        badge = {"date": ohlc["open_time"].iloc[-1], "price": 104.5,
+                 "live_price": 130.0, "signal": "SILENT", "text": "x"}
+        fig = build_candlestick_figure(ohlc, pd.DataFrame(), badge)
+        lo, hi = fig.layout.yaxis.range
+        assert lo <= 130.0 <= hi
+
+    def test_live_signal_marker_shape_by_call(self, ohlc):
+        from src.dashboard.chart import build_candlestick_figure
+
+        want = {"BUY": "triangle-up", "SELL": "triangle-down", "SILENT": "square"}
+        for call, shape in want.items():
+            badge = {"date": ohlc["open_time"].iloc[-1], "price": 104.5,
+                     "live_price": 106.0, "signal": call, "text": "x"}
+            fig = build_candlestick_figure(ohlc, pd.DataFrame(), badge)
+            shapes = [
+                t.marker.symbol for t in fig.data
+                if t.type == "scatter" and t.marker.symbol
+            ]
+            labels = [t.text[0] for t in fig.data if t.type == "scatter" and t.text]
+            assert shape in shapes
+            assert f"  LIVE {call}" in labels
+
+    def test_no_live_marker_without_live_price(self, ohlc):
+        from src.dashboard.chart import build_candlestick_figure
+
+        badge = {"date": ohlc["open_time"].iloc[-1], "price": 104.5,
+                 "signal": "BUY", "text": "x"}  # no live_price
+        fig = build_candlestick_figure(ohlc, pd.DataFrame(), badge)
+        labels = [
+            t.text[0] for t in fig.data
+            if t.type == "scatter" and t.text and "LIVE" in str(t.text[0])
+        ]
+        assert labels == []
+
+
+# ── Chart: projected expected-move band ────────────────────────────────────
+
+class TestExpectedMoveBand:
+    @pytest.fixture
+    def ohlc(self):
+        dates = pd.date_range("2026-06-01", periods=30, freq="D", tz="UTC")
+        return pd.DataFrame({
+            "open_time": dates,
+            "open": [100 + i for i in range(30)],
+            "high": [101 + i for i in range(30)],
+            "low": [99 + i for i in range(30)],
+            "close": [100 + ((i * 3) % 7) for i in range(30)],
+        })
+
+    def test_compute_band_shape(self, ohlc):
+        from src.dashboard.chart import compute_expected_band
+
+        band = compute_expected_band(ohlc, 130.0)
+        assert band is not None
+        assert band["low"] < 130.0 < band["high"]
+        assert band["sigma_pct"] > 0
+        assert band["next_x"] > ohlc["open_time"].iloc[-1]
+
+    def test_compute_band_too_few_rows(self):
+        from src.dashboard.chart import compute_expected_band
+
+        assert compute_expected_band(pd.DataFrame(), 100.0) is None
+
+    def test_band_drawn_and_axis_extended(self, ohlc):
+        from src.dashboard.chart import build_candlestick_figure, compute_expected_band
+
+        band = compute_expected_band(ohlc, 130.0)
+        badge = {"date": ohlc["open_time"].iloc[-1], "price": 106.0,
+                 "live_price": 130.0, "signal": "BUY", "text": "x",
+                 "expected_move": band}
+        fig = build_candlestick_figure(ohlc, pd.DataFrame(), badge)
+        assert any(s.type == "rect" for s in fig.layout.shapes)
+        assert any("next" in (a.text or "") for a in fig.layout.annotations)
+        assert pd.Timestamp(fig.layout.xaxis.range[1]) > ohlc["open_time"].iloc[-1]
+
+    def test_no_band_when_absent(self, ohlc):
+        from src.dashboard.chart import build_price_figure
+
+        badge = {"date": ohlc["open_time"].iloc[-1], "price": 106.0,
+                 "live_price": 130.0, "signal": "BUY", "text": "x"}  # no expected_move
+        fig = build_price_figure(ohlc, pd.DataFrame(), badge, show_markers=False)
+        assert not any("next" in (a.text or "") for a in fig.layout.annotations)
+
+
+class TestFetchLivePrice:
+    def test_parses_ticker_price(self, monkeypatch):
+        from src.dashboard import signals
+
+        class _Resp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"symbol": "BTCUSDT", "price": "77611.04"}
+
+        monkeypatch.setattr(signals.requests, "get", lambda *a, **k: _Resp())
+        assert signals.fetch_live_price("BTCUSDT") == pytest.approx(77611.04)
+
+    def test_missing_price_raises(self, monkeypatch):
+        from src.dashboard import signals
+
+        class _Resp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"symbol": "BTCUSDT"}
+
+        monkeypatch.setattr(signals.requests, "get", lambda *a, **k: _Resp())
+        with pytest.raises(ValueError):
+            signals.fetch_live_price("BTCUSDT")
+
+
 class TestSliceByRange:
     @pytest.fixture
     def ohlc(self):
