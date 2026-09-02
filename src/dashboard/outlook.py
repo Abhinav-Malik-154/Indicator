@@ -54,6 +54,15 @@ DIRECTION_CV: dict[str, Any] = {
 # feed with <item> works if this is overridden.
 DEFAULT_NEWS_URL = "https://cointelegraph.com/rss/tag/bitcoin"
 
+# Backup feeds tried in order if the primary times out or fails, so one slow host
+# never leaves the news panel blank. All free, no API key, RSS 2.0.
+FALLBACK_NEWS_URLS: tuple[str, ...] = (
+    "https://cointelegraph.com/rss/tag/bitcoin",
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "https://bitcoinmagazine.com/.rss/full/",
+    "https://cointelegraph.com/rss",
+)
+
 
 # ---------------------------------------------------------------------------
 # Expected move (magnitude) — the honest "how much"
@@ -218,41 +227,9 @@ def tag_sentiment(title: str) -> str:
     return "–"
 
 
-def fetch_news(
-    *,
-    url: str = DEFAULT_NEWS_URL,
-    limit: int = 6,
-    timeout_s: float = 10.0,
-    fetcher: Callable[[str], str] | None = None,
-) -> list[dict[str, Any]]:
-    """Fetch recent crypto headlines from a free RSS feed.
-
-    Args:
-        url: RSS 2.0 feed URL.
-        limit: Max headlines to return.
-        timeout_s: HTTP timeout (ignored when ``fetcher`` is given).
-        fetcher: Injectable ``url -> xml_text`` (for tests); defaults to
-            ``requests.get``.
-
-    Returns:
-        List of dicts with ``title``, ``link``, ``published`` and ``tag``
-        (sentiment).  Empty list on any parse/network failure.
-    """
-    try:
-        if fetcher is not None:
-            text = fetcher(url)
-        else:
-            resp = requests.get(
-                url, timeout=timeout_s,
-                headers={"User-Agent": "Mozilla/5.0 (BTC-dashboard)"},
-            )
-            resp.raise_for_status()
-            text = resp.text
-        root = ET.fromstring(text)
-    except Exception as exc:  # pragma: no cover - network / parse fallback
-        logger.warning("news: could not load feed (%s)", exc)
-        return []
-
+def _parse_feed(text: str, limit: int) -> list[dict[str, Any]]:
+    """Parse RSS 2.0 XML into tagged headline dicts (raises on bad XML)."""
+    root = ET.fromstring(text)
     items: list[dict[str, Any]] = []
     for item in root.findall(".//item")[:limit]:
         title = (item.findtext("title") or "").strip()
@@ -264,8 +241,63 @@ def fetch_news(
             "published": (item.findtext("pubDate") or "").strip(),
             "tag": tag_sentiment(title),
         })
-    logger.info("news: %d headlines from %s", len(items), url)
     return items
+
+
+def fetch_news(
+    *,
+    url: str = DEFAULT_NEWS_URL,
+    limit: int = 6,
+    timeout_s: float = 12.0,
+    retries: int = 2,
+    fetcher: Callable[[str], str] | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch recent BTC headlines from free RSS feeds, with retries + fallbacks.
+
+    Tries ``url`` first, then :data:`FALLBACK_NEWS_URLS`, each up to ``retries``
+    times, and returns the first feed that yields headlines — so a single slow or
+    down host (the timeout you saw) no longer leaves the panel blank.
+
+    Args:
+        url: Preferred RSS 2.0 feed URL (tried first).
+        limit: Max headlines to return.
+        timeout_s: Per-request HTTP timeout (ignored when ``fetcher`` is given).
+        retries: Attempts per feed before moving to the next.
+        fetcher: Injectable ``url -> xml_text`` (for tests); defaults to
+            ``requests.get``.
+
+    Returns:
+        List of dicts with ``title``, ``link``, ``published`` and ``tag``.
+        Empty list only if **every** feed fails.
+    """
+    import time
+
+    feeds = [url, *(u for u in FALLBACK_NEWS_URLS if u != url)]
+    last_exc: Exception | None = None
+    for feed_url in feeds:
+        for attempt in range(max(1, retries)):
+            try:
+                if fetcher is not None:
+                    text = fetcher(feed_url)
+                else:
+                    resp = requests.get(
+                        feed_url, timeout=timeout_s,
+                        headers={"User-Agent": "Mozilla/5.0 (BTC-dashboard)"},
+                    )
+                    resp.raise_for_status()
+                    text = resp.text
+                items = _parse_feed(text, limit)
+                if items:
+                    logger.info("news: %d headlines from %s", len(items), feed_url)
+                    return items
+            except Exception as exc:  # noqa: BLE001 - try the next feed/attempt
+                last_exc = exc
+                # Back off only for real network calls, never in tests.
+                if fetcher is None and attempt < retries - 1:
+                    time.sleep(0.5 * (attempt + 1))
+    if last_exc is not None:
+        logger.warning("news: all feeds failed (last error: %s)", last_exc)
+    return []
 
 
 def summarize_sentiment(news: list[dict[str, Any]]) -> dict[str, Any]:
