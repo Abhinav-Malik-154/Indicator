@@ -4,7 +4,7 @@ This is the real TradingView widget (the same one on tradingview.com): a
 genuinely live candlestick chart with volume, an OHLC readout, the full
 timeframe toolbar and drawing tools.  It streams via TradingView's own feed —
 no API key, no polling on our side.  It renders inside a sandboxed iframe via
-``streamlit.components.v1.html``.
+``st.iframe``.
 
 Because it is TradingView's own canvas, our model's hindsight signal markers and
 the live "Today" dot cannot be drawn on it — those live on the companion
