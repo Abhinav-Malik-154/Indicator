@@ -7,9 +7,15 @@ import pandas as pd
 import pytest
 
 from src.dashboard.live_predictor import (
+    MIN_SCORED_FOR_HIT_RATE,
+    _strength,
+    accuracy_over_time,
     candle_direction,
+    load_predictions,
     next_candle_signal,
+    predictions_path,
     predictions_table,
+    save_predictions,
     update_predictions,
 )
 
@@ -20,6 +26,24 @@ def _candles(n, drift=0.5, start="2026-08-22 10:00"):
         "open_time": pd.date_range(start, periods=n, freq="1min", tz="UTC"),
         "open": base, "high": base + 0.5, "low": base - 0.5, "close": base + 0.2,
     })
+
+
+def _series(close, start="2026-01-01 00:00"):
+    """Candles driven by a close-price array; open = previous close (realistic)."""
+    close = np.asarray(close, dtype="float64")
+    op = np.r_[close[0], close[:-1]]
+    return pd.DataFrame({
+        "open_time": pd.date_range(start, periods=len(close), freq="1min", tz="UTC"),
+        "open": op,
+        "high": np.maximum(op, close) + 0.2,
+        "low": np.minimum(op, close) - 0.2,
+        "close": close,
+    })
+
+
+def _sine(n, *, period=20, amp=2.0, base=100.0):
+    """A clean oscillation — the canonical ranging market."""
+    return base + amp * np.sin(2 * np.pi * np.arange(n) / period)
 
 
 def _append_candle(c, tgt_open, direction):
@@ -97,6 +121,20 @@ class TestUpdatePredictions:
         })
         calls = {next_candle_signal(c.iloc[:i])["predicted"] for i in range(60, len(c))}
         assert "UP" in calls and "DOWN" in calls
+
+    def test_follows_strong_uptrend(self):
+        # A steady up-trend must be RIDDEN (UP), not faded — the whole point of
+        # the regime split (old mean-reversion called DOWN into the trend).
+        sig = next_candle_signal(_candles(80, drift=0.6))
+        assert sig["predicted"] == "UP"
+        assert sig["regime"] == "trend"
+        assert sig["trend_strength"] > 0
+
+    def test_follows_strong_downtrend(self):
+        sig = next_candle_signal(_candles(80, drift=-0.6))
+        assert sig["predicted"] == "DOWN"
+        assert sig["regime"] == "trend"
+        assert sig["trend_strength"] < 0
 
     def test_too_few_candles_noop(self):
         assert update_predictions({}, _candles(10), live_price=100.0,
@@ -176,10 +214,187 @@ class TestDirectionBreakdown:
 
     def test_confidence_column_labels(self):
         table, _ = predictions_table({
-            "a": self._mk("UP", "✅", 1.0, 10),
-            "b": self._mk("DOWN", "❌", 1 / 3, 11),
+            "a": self._mk("UP", "✅", 1.0, 10),   # |score|=1.0 → firm
+            "b": self._mk("DOWN", "❌", 0.2, 11),  # |score|=0.2 → faint
         })
         assert "Conf" in table.columns
         confs = set(table["Conf"])
-        assert any("strong" in c for c in confs)
-        assert any("weak" in c for c in confs)
+        assert any("firm" in c for c in confs)
+        assert any("faint" in c for c in confs)
+
+
+class TestExpertChartBehaviour:
+    """Canonical chart scenarios with a known 'right answer' a technical trader
+    would give, encoded as regression guards for the signal's behaviour.
+
+    Verified empirically against the implementation; each asserts the *behaviour*
+    (follow strong trends, fade extremes, be humble at turning points, stay
+    balanced in a range), never a claim of real predictive edge.
+    """
+
+    # ── Trend regime: follow a strong, sustained move ──────────────────────
+    def test_strong_uptrend_is_followed(self):
+        sig = next_candle_signal(_series(np.linspace(100, 130, 90)))
+        assert sig["predicted"] == "UP"
+        assert sig["regime"] == "trend"
+
+    def test_strong_downtrend_is_followed(self):
+        sig = next_candle_signal(_series(np.linspace(130, 100, 90)))
+        assert sig["predicted"] == "DOWN"
+        assert sig["regime"] == "trend"
+
+    # ── Range regime: mean-revert the extremes ─────────────────────────────
+    def test_overbought_peak_reverts_down(self):
+        # A clean oscillation ending exactly at a peak → stretched above → DOWN.
+        sig = next_candle_signal(_series(_sine(66)))
+        assert sig["predicted"] == "DOWN"
+        assert sig["mr_score"] < 0  # mean-reversion is voting down
+
+    def test_oversold_trough_reverts_up(self):
+        sig = next_candle_signal(_series(_sine(76)))
+        assert sig["predicted"] == "UP"
+        assert sig["mr_score"] > 0
+
+    def test_oscillating_range_is_two_sided_and_balanced(self):
+        c = _series(_sine(160))
+        calls = [next_candle_signal(c.iloc[:i])["predicted"] for i in range(60, len(c))]
+        n_up = calls.count("UP")
+        n_dn = calls.count("DOWN")
+        assert n_up > 0 and n_dn > 0                     # both directions fire
+        assert min(n_up, n_dn) / max(n_up, n_dn) > 0.5   # roughly balanced, not one-sided
+
+    # ── Confidence discipline: humble, and driven by agreement ─────────────
+    def test_never_claims_strong(self):
+        # No 1-minute direction call should ever read as high certainty.
+        for s in np.linspace(-1, 1, 41):
+            assert "strong" not in _strength(float(s))
+
+    def test_conflict_lowers_conviction(self):
+        # Strong trend BUT overbought (price stretched) = genuine conflict →
+        # the call must NOT be the top "firm" tier.
+        sig = next_candle_signal(_series(np.linspace(100, 130, 90)))
+        assert "firm" not in _strength(sig["score"])
+
+    def test_aligned_trend_and_pullback_earns_firm(self):
+        # Strong up-trend with a small pullback (price back near its EMA, so
+        # mean-reversion no longer opposes) is the one high-conviction setup.
+        base = list(np.linspace(100, 120, 80)) + [119.4, 118.9, 118.6]
+        sig = next_candle_signal(_series(base))
+        assert sig["predicted"] == "UP"
+        assert "firm" in _strength(sig["score"])
+
+    def test_score_is_bounded(self):
+        for close in (np.linspace(100, 200, 90), _sine(90), _sine(90, amp=8)):
+            sig = next_candle_signal(_series(close))
+            assert -1.0 <= sig["score"] <= 1.0
+
+
+class TestAccuracyOverTime:
+    @staticmethod
+    def _mk(result, hour):
+        return {
+            "predicted_at": pd.Timestamp("2026-08-22", tz="UTC") + pd.Timedelta(hours=hour),
+            "predicted": "UP", "score": 1.0, "price": 100.0,
+            "target_open": pd.Timestamp("2026-08-22", tz="UTC") + pd.Timedelta(hours=hour),
+            "actual": None, "result": result,
+        }
+
+    def test_cumulative_hit_rate(self):
+        preds = {
+            "a": self._mk("✅", 1), "b": self._mk("✅", 2),
+            "c": self._mk("❌", 3), "d": self._mk("✅", 4),
+        }
+        df = accuracy_over_time(preds)
+        assert list(df["n"]) == [1, 2, 3, 4]
+        # running %: 100, 100, 66.7, 75
+        assert df["hit_rate"].iloc[0] == 100.0
+        assert df["hit_rate"].iloc[2] == pytest.approx(200 / 3)
+        assert df["hit_rate"].iloc[-1] == 75.0
+        assert df["time"].is_monotonic_increasing
+
+    def test_ignores_pending_and_neutral(self):
+        preds = {"a": self._mk("✅", 1), "b": self._mk(None, 2), "c": self._mk("—", 3)}
+        assert len(accuracy_over_time(preds)) == 1
+
+    def test_empty(self):
+        assert accuracy_over_time({}).empty
+
+
+class TestPersistence:
+    """Predictions must survive a refresh/logout — i.e. round-trip through disk."""
+
+    @staticmethod
+    def _preds():
+        c = _candles(60)
+        preds = update_predictions(
+            {}, c, live_price=130.0, now=pd.Timestamp("2026-08-22 11:00", tz="UTC")
+        )
+        # Add a scored one (distinct target candle) so we also cover
+        # actual/result round-tripping. Keys are always target_open.isoformat().
+        extra_open = pd.Timestamp("2026-08-22 10:58", tz="UTC")
+        preds[extra_open.isoformat()] = {
+            "predicted_at": pd.Timestamp("2026-08-22 10:57", tz="UTC"),
+            "predicted": "DOWN", "score": -0.42, "price": 129.5,
+            "target_open": extra_open,
+            "actual": "down", "result": "✅",
+        }
+        return preds
+
+    def test_round_trip_preserves_state(self, tmp_path):
+        path = tmp_path / "live_preds.csv"
+        preds = self._preds()
+        save_predictions(preds, path)
+        loaded = load_predictions(path)
+        assert set(loaded) == set(preds)
+        for k in preds:
+            for field in ("predicted", "actual", "result"):
+                assert loaded[k][field] == preds[k][field]
+            assert loaded[k]["price"] == pytest.approx(preds[k]["price"])
+            assert loaded[k]["predicted_at"] == preds[k]["predicted_at"]
+
+    def test_loaded_keys_match_target_open_isoformat(self):
+        # Keys must equal target_open.isoformat() so scoring still matches candles.
+        preds = self._preds()
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".csv") as f:
+            save_predictions(preds, f.name)
+            loaded = load_predictions(f.name)
+        for k, p in loaded.items():
+            assert k == pd.Timestamp(p["target_open"]).isoformat()
+
+    def test_missing_file_returns_empty(self, tmp_path):
+        assert load_predictions(tmp_path / "nope.csv") == {}
+
+    def test_path_is_per_symbol_interval(self):
+        p1 = predictions_path("BTCUSDT", "1m")
+        p2 = predictions_path("BTCUSDT", "5m")
+        assert p1 != p2
+        assert "BTCUSDT" in str(p1) and p1.suffix == ".csv"
+
+
+class TestSampleSizeGuard:
+    @staticmethod
+    def _mk(call, result, hour):
+        return {
+            "predicted_at": pd.Timestamp("2026-08-22", tz="UTC") + pd.Timedelta(hours=hour),
+            "predicted": call, "score": 1.0, "price": 100.0,
+            "target_open": pd.Timestamp("2026-08-22", tz="UTC") + pd.Timedelta(hours=hour),
+            "actual": None, "result": result,
+        }
+
+    def test_small_sample_not_reliable(self):
+        preds = {str(i): self._mk("UP", "✅", i) for i in range(3)}  # 3/3 = 100%
+        _, summ = predictions_table(preds)
+        assert summ["hit_rate"] == 100.0        # value still computed…
+        assert summ["reliable"] is False        # …but flagged not trustworthy
+        assert summ["by_call"]["UP"]["reliable"] is False
+        assert summ["min_scored"] == MIN_SCORED_FOR_HIT_RATE
+
+    def test_big_sample_reliable(self):
+        n = MIN_SCORED_FOR_HIT_RATE + 5
+        preds = {
+            str(i): self._mk("UP", "✅" if i % 2 else "❌", i) for i in range(n)
+        }
+        _, summ = predictions_table(preds)
+        assert summ["reliable"] is True
+        assert summ["by_call"]["UP"]["reliable"] is True
