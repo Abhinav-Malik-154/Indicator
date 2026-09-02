@@ -25,3 +25,9 @@ models/*
 # were known). Only operational/debug output from the scheduled recorder is
 # ignored.
 data/signal_log/*.out
+# Live 1-minute indicator scoreboard + paper/risk-trading runs: high-churn,
+# per-session operational state (NOT the model's tracked forward-test record),
+# so they are ignored to avoid constant git noise while the dashboard runs.
+data/signal_log/live_preds_*.csv
+data/signal_log/paper_trade_*.json
+data/signal_log/risk_trade_*.json
