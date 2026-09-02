@@ -136,6 +136,29 @@ class TestFetchNews:
     def test_default_feed_is_bitcoin_focused(self):
         assert "bitcoin" in DEFAULT_NEWS_URL.lower()
 
+    def test_falls_back_when_primary_fails(self):
+        # Primary feed times out; a later fallback works → still get headlines.
+        def fetcher(url):
+            if url == DEFAULT_NEWS_URL:
+                raise RuntimeError("read timed out")
+            return _RSS
+
+        news = fetch_news(url=DEFAULT_NEWS_URL, fetcher=fetcher)
+        assert len(news) == 3
+
+    def test_retries_same_feed_then_succeeds(self):
+        calls = {"n": 0}
+
+        def fetcher(url):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("transient blip")
+            return _RSS
+
+        news = fetch_news(fetcher=fetcher, retries=2)
+        assert len(news) == 3
+        assert calls["n"] == 2  # first attempt failed, retry succeeded
+
 
 class TestSummarizeSentiment:
     def test_net_bullish(self):
