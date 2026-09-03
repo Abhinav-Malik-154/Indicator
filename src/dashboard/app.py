@@ -21,9 +21,21 @@ from src.dashboard.chart import (
     load_chart_data,
     slice_by_range,
 )
+from src.dashboard.confluence import (
+    confluence,
+    gather_timeframe_calls,
+    setup_verdict,
+)
 from src.dashboard.freshness import MAX_AGE_HOURS, check_freshness, retrain_with_validation
 from src.dashboard.ledger import build_scorecard, build_signal_ledger
-from src.dashboard.live_predictor import poll_predictor, predictions_table
+from src.dashboard.live_predictor import (
+    accuracy_over_time,
+    load_predictions,
+    poll_predictor,
+    predictions_path,
+    predictions_table,
+    save_predictions,
+)
 from src.dashboard.live_ticker import render_live_badge
 from src.dashboard.live_track_record import accumulating_message, load_forward_test
 from src.dashboard.outlook import (
@@ -32,6 +44,22 @@ from src.dashboard.outlook import (
     fetch_news,
     predict_volatility_regime,
     summarize_sentiment,
+)
+from src.dashboard.paper_trader import (
+    STARTING_CAPITAL,
+    buy_and_hold,
+    load_portfolio,
+    max_drawdown,
+    portfolio_summary,
+    reset_portfolio,
+    save_portfolio,
+    trade_stats,
+)
+from src.dashboard.risk_trader import (
+    REWARD_RISK,
+    RISK_FRAC,
+    poll_risk_trader,
+    risk_path,
 )
 from src.dashboard.signals import (
     HISTORICAL_ACCURACY,
@@ -141,23 +169,48 @@ def _live_predictor_panel(binance_symbol: str, interval: str) -> None:
     table grows and scores itself live as candles close.
     """
     key = f"live_preds_{binance_symbol}_{interval}"
-    preds = st.session_state.get(key, {})
+    path = predictions_path(binance_symbol, interval)
+    # Restore from disk on first load of this session so the scoreboard survives
+    # a browser refresh, logout, or reopen (session_state alone is ephemeral).
+    if key not in st.session_state:
+        st.session_state[key] = load_predictions(path)
+    preds = st.session_state[key]
     try:
         preds = poll_predictor(binance_symbol, interval, preds)
     except Exception as exc:  # pragma: no cover - network/defensive UI guard
         st.caption(f"Live predictor unavailable: {exc}")
         return
     st.session_state[key] = preds
+    save_predictions(preds, path)  # persist every refresh
 
     table, summ = predictions_table(preds)
+    need = summ["min_scored"]
+
+    def _rate_display(stats: dict) -> str:
+        """Show a % only once the sample is big enough; else 'too small'.
+
+        Works for both the overall summary (``n_scored``) and the per-direction
+        stats (``n_calls``).
+        """
+        if stats["hit_rate"] is None:
+            return "—"
+        n = stats.get("n_calls", stats.get("n_scored", 0))
+        if not stats["reliable"]:
+            return f"— ({n}/{need})"
+        return f"{stats['hit_rate']:.0f}%"
+
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Predictions", len(preds))
     m2.metric("Scored", summ["n_scored"])
     m3.metric("Correct", summ["n_correct"])
-    m4.metric(
-        "Hit rate",
-        f"{summ['hit_rate']:.0f}%" if summ["hit_rate"] is not None else "—",
-    )
+    m4.metric("Hit rate", _rate_display(summ))
+
+    if summ["n_scored"] > 0 and not summ["reliable"]:
+        st.caption(
+            f"⚠ **Sample too small to trust** — only {summ['n_scored']} scored "
+            f"call(s). A hit rate isn't shown until **{need}+** (2/3 = 67% is one "
+            "lucky flip). The number will drift toward ~50% as data builds."
+        )
 
     # Per-direction detail: how the BUY (up) and SELL (down) calls each do.
     up, dn = summ["by_call"]["UP"], summ["by_call"]["DOWN"]
@@ -165,30 +218,429 @@ def _live_predictor_panel(binance_symbol: str, interval: str) -> None:
     def _dir_line(stats: dict) -> str:
         if stats["hit_rate"] is None:
             return f"{stats['n_calls']} scored · {stats['n_pending']} pending"
+        trust = "" if stats["reliable"] else "  ·  _too small_"
         return (
             f"**{stats['hit_rate']:.0f}%** "
             f"({stats['n_correct']}/{stats['n_calls']}) · "
-            f"{stats['n_pending']} pending"
+            f"{stats['n_pending']} pending{trust}"
         )
 
     d1, d2 = st.columns(2)
-    d1.metric("▲ Buy (UP) hit rate",
-              f"{up['hit_rate']:.0f}%" if up["hit_rate"] is not None else "—",
-              _dir_line(up))
-    d2.metric("▼ Sell (DOWN) hit rate",
-              f"{dn['hit_rate']:.0f}%" if dn["hit_rate"] is not None else "—",
-              _dir_line(dn))
+    d1.metric("▲ Buy (UP) hit rate", _rate_display(up), _dir_line(up))
+    d2.metric("▼ Sell (DOWN) hit rate", _rate_display(dn), _dir_line(dn))
 
     if table.empty:
         st.caption("Warming up… the first call appears on the next refresh.")
     else:
         st.dataframe(table, hide_index=True, width="stretch")
     st.caption(
-        f"Each new {interval} candle, a **two-sided mean-reversion** signal calls "
-        "UP/DOWN **before** it closes (leans DOWN when price is stretched up, UP "
-        "when dipped — so it calls both ways, not just the trend); ✅/❌ is filled "
-        "in once the candle closes. Auto-refreshes ~15s. A rule-based indicator, "
-        "**not** a proven edge — expect the hit rate to settle near ~50%."
+        f"Each new {interval} candle, a **regime-adaptive** signal calls UP/DOWN "
+        "**before** it closes: it **follows** a strong trend and **mean-reverts** "
+        "in the chop (so it stops blindly fighting trends). **Conf** = how much "
+        "the sub-signals *agree* (firm/mild/faint), **not** a probability of being "
+        "right. ✅/❌ fills in when the candle closes. Auto-refreshes ~15s. Still a "
+        f"rule-based indicator, **not** a proven edge — with {need}+ scored calls "
+        "expect ~50%."
+    )
+
+
+_GRADE_COLOUR = {"A": "#0ecb81", "B": "#F0B90B", "C": "#848e9c", "N": "#848e9c"}
+_TF_ARROW = {"UP": "▲", "DOWN": "▼", "NEUTRAL": "■"}
+
+
+@st.fragment(run_every="20s")
+def _confluence_panel(_cfg: dict) -> None:
+    """Multi-timeframe confluence + volatility-regime gate (Elder triple-screen).
+
+    Runs the next-candle signal on 1m/5m/15m/1h, takes a higher-timeframe-weighted
+    vote, and grades the moment against the volatility-regime model — so the panel
+    says *when a disciplined trader would act, and when to sit out*.
+    """
+    symbol = _cfg["symbol"]
+    try:
+        calls = gather_timeframe_calls(symbol)
+    except Exception as exc:  # pragma: no cover - network/defensive UI guard
+        st.caption(f"Confluence unavailable: {exc}")
+        return
+    if not calls:
+        st.caption("Confluence warming up… (waiting on live candles)")
+        return
+
+    conf = confluence(calls)
+    try:
+        vr = _load_vol_regime(_cfg)
+    except Exception:  # pragma: no cover - vol model optional here
+        vr = None
+    verdict = setup_verdict(conf, vr)
+    colour = _GRADE_COLOUR.get(verdict["grade"][0], "#848e9c")
+
+    left, right = st.columns([1, 2])
+    with left:
+        st.markdown(
+            f"<div style='font-size:1.6rem;font-weight:700;color:{colour}'>"
+            f"{verdict['grade']}</div>"
+            f"<div style='color:#848e9c'>setup grade</div>",
+            unsafe_allow_html=True,
+        )
+        st.metric(
+            "Confluence",
+            f"{verdict['direction']}  ({conf['agree']}/{conf['n_tf']} agree)",
+            f"vol {'EXPAND ▲' if verdict['expanding'] else 'contract'}",
+        )
+    with right:
+        cols = st.columns(len(calls))
+        for col, c in zip(cols, calls, strict=True):
+            col.metric(
+                c.timeframe,
+                f"{_TF_ARROW.get(c.predicted, '■')} {c.predicted}",
+                f"{c.regime}",
+            )
+    st.caption(f"**Read:** {verdict['action']}")
+    st.caption(
+        "Higher timeframes are weighted more (the *tide*, per Elder's Triple "
+        "Screen). Grade **A** = timeframes aligned **and** volatility expanding; "
+        "**No setup** = timeframes disagree → sit out. This is a **discipline "
+        "filter that flags better moments** — not a price oracle; direction is "
+        "still ≈50%."
+    )
+
+
+_VOTE_ARROW = {1: "▲", -1: "▼", 0: "·"}
+_VOTE_COLOUR = {1: "#0ecb81", -1: "#f6465d", 0: "#848e9c"}
+_DECISION_COLOUR = {"BUY": "#0ecb81", "SELL": "#f6465d", "HOLD": "#848e9c"}
+
+# Trading-terminal palette for the styled metric cards.
+_CARD_BG, _CARD_BORDER, _CARD_FG, _CARD_MUTED = "#181a20", "#2b3139", "#eaecef", "#848e9c"
+_POS_COL, _NEG_COL = "#0ecb81", "#f6465d"
+
+
+def _pnl_col(v: float) -> str:
+    return _POS_COL if v >= 0 else _NEG_COL
+
+
+def _metric_card(
+    label: str, value: str, sub: str = "",
+    *, value_colour: str = _CARD_FG, sub_colour: str = _CARD_MUTED,
+) -> str:
+    """A styled KPI card (HTML) that reads like a pro trading terminal tile."""
+    sub_html = (
+        f"<div style='color:{sub_colour};font-size:0.8rem;margin-top:3px'>{sub}</div>"
+        if sub else ""
+    )
+    return (
+        f"<div style='background:{_CARD_BG};border:1px solid {_CARD_BORDER};"
+        f"border-radius:12px;padding:14px 16px'>"
+        f"<div style='color:{_CARD_MUTED};font-size:0.7rem;text-transform:uppercase;"
+        f"letter-spacing:0.7px;font-weight:600'>{label}</div>"
+        f"<div style='color:{value_colour};font-size:1.65rem;font-weight:700;"
+        f"line-height:1.3;margin-top:4px'>{value}</div>{sub_html}</div>"
+    )
+
+
+def _equity_figure(
+    curve: list[dict], start: float, first_price: float | None, trades: list[dict],
+):
+    """Pro equity chart: strategy (area-filled) vs buy-and-hold, with trade markers."""
+    import plotly.graph_objects as go
+
+    df = pd.DataFrame(curve)
+    df["time"] = pd.to_datetime(df["time"])
+    fig = go.Figure()
+    if first_price:
+        hold = start * (1 - 0.001) * df["price"] / first_price
+        fig.add_trace(go.Scatter(
+            x=df["time"], y=hold, name="Buy & hold", mode="lines",
+            line={"color": "#848e9c", "width": 1.4, "dash": "dot"},
+            hovertemplate="Hold ₹%{y:,.0f}<extra></extra>",
+        ))
+    # Invisible baseline so the strategy area fills to ₹start (never down to 0).
+    fig.add_trace(go.Scatter(
+        x=df["time"], y=[start] * len(df), mode="lines", line={"width": 0},
+        showlegend=False, hoverinfo="skip",
+    ))
+    fig.add_trace(go.Scatter(
+        x=df["time"], y=df["equity"], name="Strategy", mode="lines",
+        line={"color": "#F0B90B", "width": 2.4, "shape": "spline",
+              "smoothing": 0.4},
+        fill="tonexty", fillcolor="rgba(240,185,11,0.10)",
+        hovertemplate="Equity ₹%{y:,.0f}<extra></extra>",
+    ))
+    fig.add_hline(y=start, line={"color": "#5e6673", "width": 1, "dash": "dash"})
+    # BUY / SELL markers, snapped onto the equity line at each trade's time.
+    for side, colour, symbol in (
+        ("BUY", "#0ecb81", "triangle-up"), ("SELL", "#f6465d", "triangle-down"),
+    ):
+        pts = [t for t in (trades or []) if t.get("side") == side]
+        if not pts:
+            continue
+        xs, ys = [], []
+        for t in pts:
+            idx = (df["time"] - pd.to_datetime(t["time"])).abs().idxmin()
+            xs.append(df["time"].iloc[idx])
+            ys.append(df["equity"].iloc[idx])
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="markers", name=side,
+            marker={"color": colour, "size": 11, "symbol": symbol,
+                    "line": {"color": "#0b0e11", "width": 1}},
+            hovertemplate=f"{side} ₹%{{y:,.0f}}<extra></extra>",
+        ))
+    fig.update_layout(
+        height=260, margin={"l": 0, "r": 0, "t": 30, "b": 0},
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font={"color": "#848e9c", "size": 11}, hovermode="x unified",
+        legend={"orientation": "h", "y": 1.18, "x": 0, "bgcolor": "rgba(0,0,0,0)"},
+        xaxis={"showgrid": False, "showspikes": True, "spikecolor": "#5e6673",
+               "spikethickness": 1, "spikemode": "across", "spikedash": "dot"},
+        yaxis={"gridcolor": "rgba(255,255,255,0.05)", "tickprefix": "₹",
+               "tickformat": ",.0f", "zeroline": False},
+    )
+    return fig
+
+
+@st.fragment(run_every="20s")
+def _paper_trade_panel(binance_symbol: str, interval: str) -> None:
+    """Paper-trading simulator (₹10,000 fake money) driven by the strategy ensemble.
+
+    Loads/persists the run from disk, steps it each candle, and shows equity vs a
+    buy-and-hold benchmark, P&L (fees included), win rate, drawdown, the current
+    ensemble decision, the equity curve and the trade log.  Fake money only.
+    """
+    key = f"risk_{binance_symbol}_{interval}"
+    path = risk_path(binance_symbol, interval)
+    if key not in st.session_state:
+        st.session_state[key] = load_portfolio(path)
+    state = st.session_state[key]
+
+    try:
+        state = poll_risk_trader(binance_symbol, interval, state)
+    except Exception as exc:  # pragma: no cover - network/defensive UI guard
+        st.caption(f"Risk trader unavailable: {exc}")
+        return
+    st.session_state[key] = state
+    save_portfolio(state, path)
+
+    price = float(state.get("last_price") or 0.0)
+    summ = portfolio_summary(state, price)
+    hold = buy_and_hold(state, price)
+    stats = trade_stats(state)
+    mdd = max_drawdown(state)
+    sig = state.get("last_signal", {})
+    vs_hold = summ["pnl"] - hold["pnl"]
+
+    start_cap = state["starting_capital"]
+
+    # ── Status banner: position, live stop/target, and the volatility gate ─
+    vol_on = state.get("vol_expanding", True)
+    up_on = state.get("uptrend", False)
+    trend = (
+        f"<span style='color:{_POS_COL}'>trend up ▲</span>" if up_on
+        else f"<span style='color:{_NEG_COL}'>trend down ▼</span>"
+    )
+    gate = (
+        f"<span style='color:{_POS_COL}'>vol expanding ▲</span>"
+        if vol_on else
+        f"<span style='color:{_CARD_MUTED}'>vol contracting</span>"
+    )
+    if summ["holding"]:
+        status = (
+            f"<span style='color:{_POS_COL};font-weight:700'>● LONG BTC</span> "
+            f"from ${summ['entry_price']:,.0f} · unrealized "
+            f"<span style='color:{_pnl_col(summ['unrealized'])};font-weight:600'>"
+            f"₹{summ['unrealized']:+,.0f}</span> · "
+            f"<span style='color:{_NEG_COL}'>stop ${state['stop_price']:,.0f}</span> / "
+            f"<span style='color:{_POS_COL}'>target ${state['target_price']:,.0f}</span>"
+        )
+    else:
+        status = (
+            f"<span style='color:{_CARD_MUTED};font-weight:700'>○ FLAT (cash)</span>"
+            " · waiting for a setup"
+        )
+    st.markdown(
+        f"<div style='font-size:0.95rem;margin-bottom:10px'>{status}"
+        f"<br><span style='color:{_CARD_MUTED};font-size:0.9rem'>"
+        f"BTC <b>${price:,.0f}</b> &nbsp;·&nbsp; {trend} &nbsp;·&nbsp; {gate} "
+        f"&nbsp;→&nbsp; long when <b>both</b> are favourable</span></div>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Money cards: equity, P&L, and the benchmark that matters ───────────
+    c1, c2, c3 = st.columns(3)
+    c1.markdown(_metric_card(
+        "Equity", f"₹{summ['equity']:,.0f}", f"{summ['pnl_pct']:+.2f}%",
+        sub_colour=_pnl_col(summ["pnl"])), unsafe_allow_html=True)
+    c2.markdown(_metric_card(
+        "Net P&L", f"₹{summ['pnl']:+,.0f}", f"on ₹{start_cap:,.0f} start",
+        value_colour=_pnl_col(summ["pnl"])), unsafe_allow_html=True)
+    c3.markdown(_metric_card(
+        "vs Buy & Hold", f"₹{vs_hold:+,.0f}",
+        f"hold {hold['pnl_pct']:+.2f}% · {'ahead' if vs_hold >= 0 else 'behind'}",
+        value_colour=_pnl_col(vs_hold), sub_colour=_pnl_col(vs_hold)),
+        unsafe_allow_html=True)
+
+    st.write("")
+    # ── Risk / activity cards ──────────────────────────────────────────────
+    d, e, f, g = st.columns(4)
+    wr = f"{stats['win_rate']:.0f}%" if stats["win_rate"] is not None else "—"
+    d.markdown(_metric_card("Win rate", wr,
+        f"{stats['n_wins']}W / {stats['n_losses']}L"), unsafe_allow_html=True)
+    e.markdown(_metric_card("Max drawdown", f"{mdd:.2f}%", "peak → trough",
+        value_colour=_NEG_COL if mdd < 0 else _CARD_FG), unsafe_allow_html=True)
+    f.markdown(_metric_card("Trades", f"{summ['n_trades']}", "buys + sells"),
+        unsafe_allow_html=True)
+    g.markdown(_metric_card("Fees paid", f"₹{summ['fees_paid']:,.1f}", "0.1% / trade"),
+        unsafe_allow_html=True)
+
+    st.write("")
+    # ── Live ensemble decision + coloured votes (in a card) ────────────────
+    if sig:
+        colour = _DECISION_COLOUR.get(sig["decision"], "#848e9c")
+        votes = "  ·  ".join(
+            f"<span style='color:{_VOTE_COLOUR.get(v, '#848e9c')}'>"
+            f"{name} {_VOTE_ARROW.get(v, '·')}</span>"
+            for name, v in sig["votes"].items()
+        )
+        st.markdown(
+            f"<div style='background:{_CARD_BG};border:1px solid {_CARD_BORDER};"
+            f"border-radius:12px;padding:12px 16px'>"
+            f"<b>Ensemble now:</b> <span style='color:{colour};font-weight:700;"
+            f"font-size:1.05rem'>{sig['decision']}</span> "
+            f"<span style='color:{_CARD_MUTED}'>· net {sig['net']:+.2f}</span>"
+            f"<div style='margin-top:6px'>{votes}</div></div>",
+            unsafe_allow_html=True,
+        )
+
+    st.write("")
+    # ── Equity curve vs buy-and-hold (auto-scaled, trade markers) ──────────
+    curve = state.get("equity_curve", [])
+    if len(curve) >= 2:
+        st.plotly_chart(
+            _equity_figure(curve, start_cap, state.get("first_price"),
+                           state.get("trades", [])),
+            width="stretch", config={"displayModeBar": False},
+        )
+    else:
+        st.caption("Equity curve builds as the run progresses…")
+
+    # ── Trade log + reset ──────────────────────────────────────────────────
+    trades = list(reversed(state.get("trades", [])))[:8]
+    if trades:
+        tdf = pd.DataFrame([
+            {
+                "Time": pd.to_datetime(t["time"]).strftime("%m-%d %H:%M"),
+                "Side": t["side"],
+                "Price": f"${t['price']:,.0f}",
+                "Qty (BTC)": f"{t['qty']:.6f}",
+                "Fee": f"₹{t['fee']:,.2f}",
+                "Realized": f"₹{t['realized']:+,.1f}" if "realized" in t else "—",
+                "Reason": t.get("reason", "entry" if t["side"] == "BUY" else "—"),
+            }
+            for t in trades
+        ])
+        st.dataframe(tdf, hide_index=True, width="stretch")
+    if st.button("↺ Reset to ₹10,000", key=f"reset_{key}"):
+        st.session_state[key] = reset_portfolio(path)
+        st.rerun()
+
+    st.caption(
+        f"**Fake ₹{STARTING_CAPITAL:,.0f}, risk-managed — trend-following long/flat.** "
+        "It goes **long** when the market is in an **uptrend** *and* **volatility is "
+        "expanding** (backed by the 5-strategy ensemble), risking just "
+        f"**{RISK_FRAC:.0%} of equity** per trade with an **ATR stop-loss and a "
+        f"{REWARD_RISK:.0f}:1 take-profit** — so winners outrun losers even below a "
+        "50% hit rate (*expectancy*, the real source of profit, not accuracy); "
+        "otherwise it stays in **cash**. Gold = strategy, dotted = **buy & hold** "
+        "(the bar to beat). Fake money; real exchanges add fees + 1% TDS. **Not "
+        "financial advice.**"
+    )
+
+
+@st.fragment(run_every="20s")
+def _compare_panel(_cfg: dict) -> None:
+    """Investment vs Prediction on one shared time axis, + a Strategy-vs-Hold verdict.
+
+    Reads both runs from disk (their panels persist every refresh), so it stays
+    current: equity curve (strategy vs buy-and-hold) on top, the live predictor's
+    cumulative hit-rate below — same time axis, directly comparable.
+    """
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    symbol = _cfg["symbol"]
+    paper = load_portfolio(risk_path(symbol, "15m"))
+    pred_interval = st.session_state.get("pred_interval") or "1m"
+    preds = load_predictions(predictions_path(symbol, pred_interval))
+
+    price = float(paper.get("last_price") or 0.0)
+    if price <= 0:
+        st.caption("Comparison builds once the investment run has ticked…")
+        return
+    summ = portfolio_summary(paper, price)
+    hold = buy_and_hold(paper, price)
+    beat = summ["pnl"] - hold["pnl"]
+
+    # ── Verdict: did the strategy beat simply holding? ─────────────────────
+    v1, v2, v3 = st.columns(3)
+    v1.markdown(_metric_card(
+        "Strategy", f"₹{summ['equity']:,.0f}", f"{summ['pnl_pct']:+.2f}%",
+        value_colour=_pnl_col(summ["pnl"])), unsafe_allow_html=True)
+    v2.markdown(_metric_card(
+        "Buy & hold BTC", f"₹{hold['value']:,.0f}", f"{hold['pnl_pct']:+.2f}%",
+        value_colour=_pnl_col(hold["pnl"])), unsafe_allow_html=True)
+    verdict = "BEAT hold" if beat >= 0 else "LAGGED hold"
+    v3.markdown(_metric_card(
+        "Verdict", f"₹{beat:+,.0f}", verdict,
+        value_colour=_pnl_col(beat), sub_colour=_pnl_col(beat)),
+        unsafe_allow_html=True)
+
+    # ── Shared-time-axis chart: equity (top) + prediction hit-rate (bottom) ─
+    curve = paper.get("equity_curve", [])
+    acc = accuracy_over_time(preds)
+    if len(curve) < 2:
+        st.caption("Equity curve is still warming up…")
+        return
+    cdf = pd.DataFrame(curve)
+    cdf["time"] = pd.to_datetime(cdf["time"])
+    start = paper["starting_capital"]
+    fp = paper.get("first_price")
+
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+        row_heights=[0.62, 0.38],
+        subplot_titles=("Investment: strategy vs buy & hold (₹)",
+                        f"Prediction accuracy over time ({pred_interval}, → ~50%)"),
+    )
+    if fp:
+        fig.add_trace(go.Scatter(
+            x=cdf["time"], y=start * (1 - 0.001) * cdf["price"] / fp, mode="lines",
+            name="Buy & hold", line={"color": "#848e9c", "width": 1.4, "dash": "dot"}),
+            row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=cdf["time"], y=cdf["equity"], mode="lines", name="Strategy",
+        line={"color": "#F0B90B", "width": 2.2}), row=1, col=1)
+    fig.add_hline(y=start, line={"color": "#5e6673", "width": 1, "dash": "dash"},
+                  row=1, col=1)
+    if not acc.empty:
+        fig.add_trace(go.Scatter(
+            x=acc["time"], y=acc["hit_rate"], mode="lines", name="Hit rate %",
+            line={"color": "#0ecb81", "width": 2}), row=2, col=1)
+    fig.add_hline(y=50, line={"color": "#f6465d", "width": 1, "dash": "dash"},
+                  row=2, col=1)
+    fig.update_layout(
+        height=430, margin={"l": 0, "r": 0, "t": 40, "b": 0},
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font={"color": "#848e9c", "size": 11}, hovermode="x unified",
+        showlegend=True, legend={"orientation": "h", "y": 1.12, "x": 0},
+    )
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(gridcolor="rgba(255,255,255,0.05)")
+    fig.update_yaxes(tickprefix="₹", tickformat=",.0f", row=1, col=1)
+    fig.update_yaxes(ticksuffix="%", range=[0, 100], row=2, col=1)
+    st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+    st.caption(
+        "Same time axis: **top** = your ₹10,000 investment (gold) vs just holding "
+        "BTC (dotted); **bottom** = the 1-minute predictor's running accuracy, which "
+        "drifts to **~50%** (a coin flip). The honest takeaway: prediction doesn't "
+        "beat chance — value comes from disciplined *investing*, not calling candles."
     )
 
 
@@ -277,12 +729,59 @@ if result["error"]:
         f"Live fetch failed — showing cached data instead.\n\nReason: {result['error']}"
     )
 
-# ── Page header ───────────────────────────────────────────────────────────
-st.title("BTC/USDT Signal Dashboard  ·  1d pruned model")
-h1, h2, h3 = st.columns(3)
-h1.metric("Latest candle", str(result["candle_date"].date()))
-h2.metric("BTC close", f"${result['current_close']:,.2f}")
-h3.metric("Data source", result["data_source"])
+# ── Command Center hero: live price + the three genuinely-useful signals ───
+_hero_price = float(result["current_close"])
+try:
+    _hero_vr = _load_vol_regime(cfg)
+    _vr_expand = _hero_vr["regime"] == "EXPAND"
+    _vr_value = "EXPAND ▲" if _vr_expand else "CONTRACT ▼"
+    _vr_sub = f"P={_hero_vr['p_expand']:.0%} · backtested 69% (real edge)"
+except Exception:  # pragma: no cover - model warming up / data missing
+    _vr_expand, _vr_value, _vr_sub = False, "—", "vol model warming up"
+try:
+    _hero_cd = _load_chart_data(cfg)
+    _hero_bp = float(_hero_cd["badge"].get("live_price") or _hero_cd["badge"]["price"])
+    _hero_em = expected_move(_hero_cd["ohlc"]["close"].tolist(), _hero_bp)
+    _em_value = f"±{_hero_em['sigma_pct']:.1f}%"
+    _em_sub = f"~${_hero_em['typical_move_usd']:,.0f} · typical 1-day move"
+except Exception:  # pragma: no cover - defensive
+    _em_value, _em_sub = "—", "n/a"
+
+st.markdown(
+    f"<div style='background:linear-gradient(135deg,#181a20,#0b0e11);"
+    f"border:1px solid #2b3139;border-radius:16px;padding:22px 26px;"
+    f"margin-bottom:14px;display:flex;justify-content:space-between;"
+    f"align-items:center;flex-wrap:wrap;gap:14px'>"
+    f"<div><div style='color:#F0B90B;font-size:1.55rem;font-weight:800;"
+    f"letter-spacing:0.3px'>₿ BTC Command Center</div>"
+    f"<div style='color:#848e9c;font-size:0.85rem'>Honest signals — built to "
+    f"inform, not to gamble · {result['candle_date'].date()}</div></div>"
+    f"<div style='text-align:right'><div style='color:#eaecef;font-size:2.1rem;"
+    f"font-weight:800;line-height:1'>${_hero_price:,.0f}</div>"
+    f"<div style='color:#848e9c;font-size:0.78rem'>latest close · "
+    f"{result['data_source']}</div></div></div>",
+    unsafe_allow_html=True,
+)
+hc1, hc2, hc3 = st.columns(3)
+hc1.markdown(_metric_card(
+    "① Volatility regime · the real edge", _vr_value, _vr_sub,
+    value_colour=_POS_COL if _vr_expand else _CARD_FG), unsafe_allow_html=True)
+hc2.markdown(_metric_card(
+    "② Expected move · the honest 'how much'", _em_value, _em_sub),
+    unsafe_allow_html=True)
+hc3.markdown(_metric_card(
+    "③ Direction · coin-flip guardrail", f"{result['prob_lr']:.0%} up",
+    "≈ 50% — size risk, don't chase", sub_colour=_NEG_COL),
+    unsafe_allow_html=True)
+st.markdown(
+    f"<div style='color:#848e9c;font-size:0.9rem;margin-top:10px'>🧭 "
+    f"<b>Today's read:</b> volatility likely to "
+    f"<b style='color:{'#0ecb81' if _vr_expand else '#eaecef'}'>"
+    f"{'expand' if _vr_expand else 'contract'}</b>; a typical day moves "
+    f"<b>{_em_value}</b>; direction is a coin flip — so <b>manage risk, don't "
+    f"predict</b>.</div>",
+    unsafe_allow_html=True,
+)
 
 # ── Live signal alert (banner + browser notification while tab open) ──────
 render_alerts(result)
@@ -399,37 +898,68 @@ _live_predictor_panel(cfg["symbol"], _pred_interval)
 
 st.divider()
 
+# ── Multi-timeframe confluence + volatility gate (expert discipline filter) ─
+st.subheader("🎯 Multi-timeframe confluence  ·  when to act, when to sit out")
+st.caption(
+    "The disciplined-trader view: do 1m/5m/15m/1h **agree**, and is volatility "
+    "expanding? Most moments are **No setup** — that's the point. A filter for "
+    "*better moments*, not a prediction."
+)
+_confluence_panel(cfg)
+
+st.divider()
+
+# ── Paper-trading simulator (₹10,000 fake money, strategy ensemble) ─────────
+st.subheader("💰 Risk-managed paper trading  ·  ₹10,000  ·  vol-gated, stop/target")
+st.caption(
+    "The professional version: the strategy ensemble only enters when **volatility "
+    "is expanding**, every trade has an **ATR stop-loss + a bigger take-profit**, "
+    "and each risks a fixed slice of equity. This attacks **expectancy** (winners > "
+    "losers), the real source of profit — not the ~50% hit rate. Fake money only."
+)
+# Fixed investment horizon — no interval selector. This is a long/flat
+# *investment* view (hold through trends), not a scalping toy you retune.
+_paper_trade_panel(cfg["symbol"], "15m")
+
+st.divider()
+
+# ── Investment vs Prediction: one shared time axis + a verdict ─────────────
+st.subheader("📊 Investment vs Prediction  ·  same time axis  ·  the honest verdict")
+st.caption(
+    "Did disciplined **investing** beat just holding — and does short-term "
+    "**prediction** actually work? Both on one time axis so you can see the truth."
+)
+_compare_panel(cfg)
+
+st.divider()
+
 # ── Next-candle outlook (honest: magnitude + vol-regime are real; direction ~50%)
 st.subheader("🔮 Next-candle outlook")
 st.caption(
-    "What's *actually* forecastable before the next daily candle. Magnitude and "
-    "volatility-regime are backtested and real; direction is ≈ a coin flip "
-    "(measured). Not financial advice."
+    "Ordered by how much you can trust it. **Volatility-regime and magnitude are "
+    "backtested, real edges** — lead with these. **Direction is ≈ a coin flip** "
+    "(measured) — it comes last, as a guardrail. Not financial advice."
 )
 oc1, oc2, oc3 = st.columns(3)
 
-# Direction — a guardrail, not a signal: P(up) stamped with its precise
-# measured accuracy so an up/down "lean" is never mistaken for knowledge.
+# Volatility regime FIRST — the real, statistically-significant edge (Task 3).
 with oc1:
-    st.markdown("**Direction**  ·  _guardrail, not a signal_")
-    lean = "UP ▲" if result["prob_lr"] >= 0.5 else "DOWN ▼"
-    dist_pp = (result["prob_lr"] - 0.5) * 100.0
-    st.metric("P(up) · LR", f"{result['prob_lr']:.1%}", f"{lean}  ({dist_pp:+.1f}pp)")
-    d = DIRECTION_CV
-    st.caption(
-        f"⚠ **Backtested {d['accuracy']:.1%} "
-        f"[{d['ci_low']:.1%}, {d['ci_high']:.1%}]** over {d['n']:,} out-of-sample "
-        f"days (walk-forward CV) · base rate {d['base_rate']:.1%} sits **inside** "
-        f"the CI → **{d['verdict']}** (edge {d['edge_pp']:+.1f}pp)."
-    )
-    st.caption(
-        "So this P(up) is a **lean, not a forecast** — even at 55% the honest read "
-        "is 'basically a coin flip.' Use it to size *down* conviction, never up."
-    )
+    st.markdown("**① Volatility regime**  ·  _the real edge_")
+    try:
+        vr = _load_vol_regime(cfg)
+        arrow = "EXPAND ▲" if vr["regime"] == "EXPAND" else "CONTRACT ▼"
+        st.metric("Next window", arrow, f"P(expand)={vr['p_expand']:.0%}")
+        pt, lo, hi = vr["cv_accuracy"]
+        st.caption(
+            f"✓ Backtested **{pt * 100:.0f}%** [{lo * 100:.0f}%, {hi * 100:.0f}%] "
+            f"(walk-forward CV) — a **real** edge. Predicts vol size, not direction."
+        )
+    except Exception as exc:  # pragma: no cover - defensive UI guard
+        st.caption(f"Volatility-regime model unavailable: {exc}")
 
-# Expected move — the legitimate "how much".
+# Expected move SECOND — the legitimate, forecastable "how much".
 with oc2:
-    st.markdown("**Expected move**")
+    st.markdown("**② Expected move**  ·  _the honest 'how much'_")
     try:
         _cd = _load_chart_data(cfg)
         base_price = float(
@@ -445,20 +975,24 @@ with oc2:
     except Exception as exc:  # pragma: no cover - defensive UI guard
         st.caption(f"Expected move unavailable: {exc}")
 
-# Volatility regime — the real, significant edge (Task 3).
+# Direction LAST — a guardrail, not a signal: P(up) stamped with its precise
+# measured accuracy so an up/down "lean" is never mistaken for knowledge.
 with oc3:
-    st.markdown("**Volatility regime**")
-    try:
-        vr = _load_vol_regime(cfg)
-        arrow = "EXPAND ▲" if vr["regime"] == "EXPAND" else "CONTRACT ▼"
-        st.metric("Next window", arrow, f"P(expand)={vr['p_expand']:.0%}")
-        pt, lo, hi = vr["cv_accuracy"]
-        st.caption(
-            f"✓ Backtested **{pt * 100:.0f}%** [{lo * 100:.0f}%, {hi * 100:.0f}%] "
-            f"(walk-forward CV) — a **real** edge. Predicts vol size, not direction."
-        )
-    except Exception as exc:  # pragma: no cover - defensive UI guard
-        st.caption(f"Volatility-regime model unavailable: {exc}")
+    st.markdown("**③ Direction**  ·  _coin flip — guardrail only_")
+    lean = "UP ▲" if result["prob_lr"] >= 0.5 else "DOWN ▼"
+    dist_pp = (result["prob_lr"] - 0.5) * 100.0
+    st.metric("P(up) · LR", f"{result['prob_lr']:.1%}", f"{lean}  ({dist_pp:+.1f}pp)")
+    d = DIRECTION_CV
+    st.caption(
+        f"⚠ **Backtested {d['accuracy']:.1%} "
+        f"[{d['ci_low']:.1%}, {d['ci_high']:.1%}]** over {d['n']:,} out-of-sample "
+        f"days (walk-forward CV) · base rate {d['base_rate']:.1%} sits **inside** "
+        f"the CI → **{d['verdict']}** (edge {d['edge_pp']:+.1f}pp)."
+    )
+    st.caption(
+        "So this P(up) is a **lean, not a forecast** — even at 55% the honest read "
+        "is 'basically a coin flip.' Use it to size *down* conviction, never up."
+    )
 
 with st.expander("📰 Today's BTC news  ·  learn what moves BTC", expanded=True):
     news = _load_news()
