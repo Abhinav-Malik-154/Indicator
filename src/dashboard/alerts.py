@@ -121,9 +121,9 @@ def browser_notification_html(texts: list[str], *, title: str = "BTC signal") ->
     """Return an HTML/JS snippet that raises browser notifications for ``texts``.
 
     Requests notification permission on first use and shows one notification per
-    alert.  Rendered via ``streamlit.components.v1.html``.  If the user denies
-    permission or the browser blocks it, nothing happens — the in-app banner is
-    always the primary channel.
+    alert.  Rendered via ``st.iframe`` (a zero-height JS iframe).  If the user
+    denies permission or the browser blocks it, nothing happens — the in-app
+    banner is always the primary channel.
     """
     payload = json.dumps(texts)
     safe_title = json.dumps(title)
@@ -163,7 +163,6 @@ def render_alerts(result: dict[str, Any]) -> list[dict[str, Any]]:
         The list of alerts that fired (also useful for tests).
     """
     import streamlit as st
-    import streamlit.components.v1 as components
 
     alerts = alerts_for_result(result)
     if not alerts:
@@ -176,10 +175,15 @@ def render_alerts(result: dict[str, Any]) -> list[dict[str, Any]]:
     for alert in alerts:
         st.warning(f"⚠️ {html.unescape(alert['text'])}")
 
-    components.html(
-        browser_notification_html([a["text"] for a in alerts]),
-        height=0,
-    )
+    # 1px, effectively invisible iframe that just runs the notification JS.
+    # Best-effort only: a browser/render hiccup here must never break the page.
+    try:
+        st.iframe(
+            browser_notification_html([a["text"] for a in alerts]),
+            height=1,
+        )
+    except Exception:  # noqa: BLE001 - the in-app banner above is the real channel
+        pass
     st.caption(
         "Alerts fire only while this tab is open. The permanent, always-on "
         "record is written by `python -m src.monitor.record_signal` (see "
