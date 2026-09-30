@@ -173,7 +173,7 @@ def render_alerts(result: dict[str, Any]) -> list[dict[str, Any]]:
         return alerts
 
     for alert in alerts:
-        st.warning(f"⚠️ {html.unescape(alert['text'])}")
+        st.warning(html.unescape(alert['text']))
 
     # 1px, effectively invisible iframe that just runs the notification JS.
     # Best-effort only: a browser/render hiccup here must never break the page.
