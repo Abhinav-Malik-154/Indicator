@@ -9,6 +9,73 @@ directional edge**.
 This project exists to show how to do this kind of work correctly, not to
 sell a winning trading strategy.
 
+> **Status:** Research and forward-testing project. The current evidence does
+> not demonstrate a directional edge. Do not use this project as financial
+> advice or as an automated trading system.
+
+[Dashboard](DASHBOARD.md) · [Contributing](CONTRIBUTING.md) · [License](LICENSE.md)
+
+## At A Glance
+
+| Area | Summary |
+|---|---|
+| Scope | BTC/USDT daily price-direction research |
+| Validation | Chronological walk-forward splits with leakage controls |
+| Models | Logistic regression and LightGBM |
+| Current finding | No demonstrated out-of-sample directional edge |
+| Dashboard | Streamlit app with live market context and model signals |
+
+## Dashboard Preview
+
+The dashboard is the project's operational view for live candles, model
+signals, historical scorecards, volatility context, and the leakage-immune
+forward test. Keep screenshots under [`docs/assets/dashboard/`](docs/assets/dashboard/)
+so they can be refreshed without changing the README structure.
+
+<div align="center">
+  <table width="100%" cellpadding="10" cellspacing="0" border="0">
+    <tr>
+      <td width="48%" valign="top" style="padding-right: 14px;">
+        <div style="background:#0f172a;border:1px solid #2b3342;border-radius:10px;padding:12px;">
+          <div style="font-size:14px;font-weight:700;color:#e5e7eb;margin-bottom:10px;">
+            When & where — the model's BUY/SELL calls
+          </div>
+          <img src="docs/assets/dashboard/ledger/ledger.png" alt="Signal ledger panel" width="100%" style="border-radius:8px;border:1px solid #2b3342;display:block;" />
+          <div style="font-size:12px;color:#9ca3af;margin-top:8px;">
+            Paste the ledger screenshot here.
+          </div>
+        </div>
+      </td>
+      <td width="48%" valign="top" style="padding-left: 14px;">
+        <div style="background:#0f172a;border:1px solid #2b3342;border-radius:10px;padding:12px;">
+          <div style="font-size:14px;font-weight:700;color:#e5e7eb;margin-bottom:10px;">
+            Right vs wrong — how those calls landed
+          </div>
+          <img src="docs/assets/dashboard/scorecard/scorecard.png" alt="Signal scorecard panel" width="100%" style="border-radius:8px;border:1px solid #2b3342;display:block;" />
+          <div style="font-size:12px;color:#9ca3af;margin-top:8px;">
+            Paste the scorecard screenshot here.
+          </div>
+        </div>
+      </td>
+    </tr>
+    <tr>
+      <td colspan="2" style="padding-top: 18px;">
+        <div style="background:#0f172a;border:1px solid #2b3342;border-radius:10px;padding:12px;">
+          <div style="font-size:14px;font-weight:700;color:#e5e7eb;margin-bottom:10px;">
+            Full dashboard overview
+          </div>
+          <img src="docs/assets/dashboard/full/full-dashboard.png" alt="Full dashboard view" width="100%" style="border-radius:8px;border:1px solid #2b3342;display:block;" />
+        </div>
+      </td>
+    </tr>
+  </table>
+</div>
+
+> Replace the placeholder filenames with the final screenshots you capture from the app.
+
+See [DASHBOARD.md](DASHBOARD.md) for the complete panel guide and launch
+instructions.
+
 ---
 
 ## Why this project exists
@@ -263,3 +330,12 @@ For the complete phase-by-phase methodology, data, and evaluation details,
 see [PHASES.md](PHASES.md).
 
 For dashboard run instructions and panel descriptions, see [DASHBOARD.md](DASHBOARD.md).
+
+## Project Documents
+
+- [Accuracy notes](ACCURACY.md) — interpretation of reported performance.
+- [Phase notes](PHASES.md) — detailed methodology and experiment history.
+- [Dashboard guide](DASHBOARD.md) — panels, data freshness, and live behavior.
+- [Monitoring guide](MONITORING.md) — append-only forward-test scheduling.
+- [Contributing](CONTRIBUTING.md) — development workflow and review standards.
+- [License](LICENSE.md) — MIT license and project usage terms.
