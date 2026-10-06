@@ -78,7 +78,6 @@ from src.models.train import load_modeling_config
 
 st.set_page_config(
     page_title="BTC Signal Dashboard",
-    page_icon="📊",
     layout="wide",
 )
 
@@ -207,7 +206,7 @@ def _live_predictor_panel(binance_symbol: str, interval: str) -> None:
 
     if summ["n_scored"] > 0 and not summ["reliable"]:
         st.caption(
-            f"⚠ **Sample too small to trust** — only {summ['n_scored']} scored "
+            f"Sample too small to trust — only {summ['n_scored']} scored "
             f"call(s). A hit rate isn't shown until **{need}+** (2/3 = 67% is one "
             "lucky flip). The number will drift toward ~50% as data builds."
         )
@@ -238,7 +237,7 @@ def _live_predictor_panel(binance_symbol: str, interval: str) -> None:
         "**before** it closes: it **follows** a strong trend and **mean-reverts** "
         "in the chop (so it stops blindly fighting trends). **Conf** = how much "
         "the sub-signals *agree* (firm/mild/faint), **not** a probability of being "
-        "right. ✅/❌ fills in when the candle closes. Auto-refreshes ~15s. Still a "
+        "right. Correct/incorrect fills in when the candle closes. Auto-refreshes ~15s. Still a "
         f"rule-based indicator, **not** a proven edge — with {need}+ scored calls "
         "expect ~50%."
     )
@@ -700,7 +699,7 @@ st.warning(
 freshness = check_freshness(_MANIFEST_PATH, max_age_hours=MAX_AGE_HOURS)
 if freshness["is_stale"]:
     banner = st.container()
-    banner.warning(f"🕒 {freshness['message']}")
+    banner.warning(freshness['message'])
     if banner.button("Retrain now (validated)", type="primary"):
         with st.spinner("Retraining into staging and running the validation gate…"):
             outcome = retrain_with_validation(_INTERVAL, cfg)
@@ -718,7 +717,7 @@ if freshness["is_stale"]:
         _load_chart_data.clear()
         st.rerun()
 else:
-    st.caption(f"🟢 {freshness['message']}")
+    st.caption(freshness['message'])
 
 # ── Fetch live signal ─────────────────────────────────────────────────────
 with st.spinner("Fetching latest candle from Binance…"):
@@ -774,7 +773,7 @@ hc3.markdown(_metric_card(
     "≈ 50% — size risk, don't chase", sub_colour=_NEG_COL),
     unsafe_allow_html=True)
 st.markdown(
-    f"<div style='color:#848e9c;font-size:0.9rem;margin-top:10px'>🧭 "
+    f"<div style='color:#848e9c;font-size:0.9rem;margin-top:10px'>"
     f"<b>Today's read:</b> volatility likely to "
     f"<b style='color:{'#0ecb81' if _vr_expand else '#eaecef'}'>"
     f"{'expand' if _vr_expand else 'contract'}</b>; a typical day moves "
@@ -790,7 +789,7 @@ st.divider()
 
 # ── Price charts: live TradingView embed + model-signal candlestick ───────
 st.subheader("BTC price")
-tab_live, tab_signals = st.tabs(["📈 Live (TradingView)", "🎯 Signals (model)"])
+tab_live, tab_signals = st.tabs(["Live (TradingView)", "Signals (model)"])
 
 with tab_live:
     lc1, lc2, lc3 = st.columns([2, 1.4, 1])
@@ -839,7 +838,7 @@ with tab_signals:
 st.divider()
 
 # ── Signal ledger + scorecard (when/where the model called BUY/SELL, and hits/misses)
-st.subheader("📋 Signal ledger & scorecard")
+st.subheader("Signal ledger & scorecard")
 
 _now = "BUY ▲" if result["signal_lr"] == "BUY" else (
     "SELL ▼" if result["signal_lr"] == "SELL" else "SILENT (no position)"
@@ -850,7 +849,15 @@ st.markdown(
 )
 
 _markers = _load_chart_data(cfg)["markers"]
-led_col, score_col = st.columns([1, 1.4])
+score_tbl, summ = build_scorecard(_markers, limit=30)
+
+if summ["accuracy_pct"] is not None:
+    s1, s2, s3 = st.columns(3)
+    s1.metric("Correct", summ["n_correct"])
+    s2.metric("Wrong", summ["n_wrong"])
+    s3.metric("Hit rate", f"{summ['accuracy_pct']:.0f}%")
+
+led_col, score_col = st.columns([1.1, 1.5], vertical_alignment="top")
 
 with led_col:
     st.markdown("**When & where — the model's BUY/SELL calls**")
@@ -858,22 +865,17 @@ with led_col:
     if ledger.empty:
         st.caption("No directional calls yet (the 0.60 confidence gate hasn't fired).")
     else:
-        st.dataframe(ledger, hide_index=True, width="stretch")
+        st.dataframe(ledger, hide_index=True, use_container_width=True)
     st.caption("Entry = the close on the day the model signalled. Most recent first.")
 
 with score_col:
     st.markdown("**Right vs wrong — how those calls landed**")
-    score_tbl, summ = build_scorecard(_markers, limit=30)
     if summ["accuracy_pct"] is None:
         st.caption("No scored calls yet.")
     else:
-        s1, s2, s3 = st.columns(3)
-        s1.metric("Correct", summ["n_correct"])
-        s2.metric("Wrong", summ["n_wrong"])
-        s3.metric("Hit rate", f"{summ['accuracy_pct']:.0f}%")
-        st.dataframe(score_tbl, hide_index=True, width="stretch")
+        st.dataframe(score_tbl, hide_index=True, use_container_width=True)
     st.caption(
-        "Outcome = actual move one day later (✅ right / ❌ wrong). These are "
+        "Outcome = actual move one day later (right / wrong). These are "
         "out-of-sample calls on data the model never trained on — an honest track "
         "record, **not** a promise (measured edge is ≈0)."
     )
@@ -881,7 +883,7 @@ with score_col:
 st.divider()
 
 # ── Live next-candle predictor (self-scoring, updates every refresh) ───────
-st.subheader("🔮 Live next-candle predictor  ·  self-scoring")
+st.subheader("Live next-candle predictor  ·  self-scoring")
 st.caption(
     "Forward-looking: calls the **next** candle before it closes, then scores "
     "itself when it does — a running, honest track record that updates live."
@@ -899,7 +901,7 @@ _live_predictor_panel(cfg["symbol"], _pred_interval)
 st.divider()
 
 # ── Multi-timeframe confluence + volatility gate (expert discipline filter) ─
-st.subheader("🎯 Multi-timeframe confluence  ·  when to act, when to sit out")
+st.subheader("Multi-timeframe confluence  ·  when to act, when to sit out")
 st.caption(
     "The disciplined-trader view: do 1m/5m/15m/1h **agree**, and is volatility "
     "expanding? Most moments are **No setup** — that's the point. A filter for "
@@ -910,7 +912,7 @@ _confluence_panel(cfg)
 st.divider()
 
 # ── Paper-trading simulator (₹10,000 fake money, strategy ensemble) ─────────
-st.subheader("💰 Risk-managed paper trading  ·  ₹10,000  ·  vol-gated, stop/target")
+st.subheader("Risk-managed paper trading  ·  ₹10,000  ·  vol-gated, stop/target")
 st.caption(
     "The professional version: the strategy ensemble only enters when **volatility "
     "is expanding**, every trade has an **ATR stop-loss + a bigger take-profit**, "
@@ -924,7 +926,7 @@ _paper_trade_panel(cfg["symbol"], "15m")
 st.divider()
 
 # ── Investment vs Prediction: one shared time axis + a verdict ─────────────
-st.subheader("📊 Investment vs Prediction  ·  same time axis  ·  the honest verdict")
+st.subheader("Investment vs Prediction  ·  same time axis  ·  the honest verdict")
 st.caption(
     "Did disciplined **investing** beat just holding — and does short-term "
     "**prediction** actually work? Both on one time axis so you can see the truth."
@@ -934,7 +936,7 @@ _compare_panel(cfg)
 st.divider()
 
 # ── Next-candle outlook (honest: magnitude + vol-regime are real; direction ~50%)
-st.subheader("🔮 Next-candle outlook")
+st.subheader("Next-candle outlook")
 st.caption(
     "Ordered by how much you can trust it. **Volatility-regime and magnitude are "
     "backtested, real edges** — lead with these. **Direction is ≈ a coin flip** "
@@ -984,7 +986,7 @@ with oc3:
     st.metric("P(up) · LR", f"{result['prob_lr']:.1%}", f"{lean}  ({dist_pp:+.1f}pp)")
     d = DIRECTION_CV
     st.caption(
-        f"⚠ **Backtested {d['accuracy']:.1%} "
+        f"Backtested {d['accuracy']:.1%} "
         f"[{d['ci_low']:.1%}, {d['ci_high']:.1%}]** over {d['n']:,} out-of-sample "
         f"days (walk-forward CV) · base rate {d['base_rate']:.1%} sits **inside** "
         f"the CI → **{d['verdict']}** (edge {d['edge_pp']:+.1f}pp)."
@@ -1127,7 +1129,7 @@ st.caption(
 track = _load_track_record(cfg)
 if not track["enough_data"]:
     st.info(
-        f"📈 {accumulating_message(track['days_recorded'], track['min_days'])}. "
+        f"{accumulating_message(track['days_recorded'], track['min_days'])}. "
         f"A forward-test accuracy will appear once at least {track['min_days']} "
         "days of signals have been logged — showing a number before then would "
         "be noise, not evidence."

@@ -11,7 +11,8 @@ Flow, per refresh:
 2. Call the next (forming) candle's direction from the technical rating — one call
    per candle (deduplicated by the target candle's open time).
 3. Score any earlier prediction whose target candle has since closed: green candle
-   (close > open) = "up", red = "down"; ``✅`` if the call matched, else ``❌``.
+   (close > open) = "up", red = "down"; a correct match is marked as correct,
+   otherwise wrong.
 
 It is a rule-based momentum indicator, **not** a proven edge — on noisy 1m bars
 the hit rate settles near ~50%.  The table shows that honestly, in real time.
@@ -37,8 +38,8 @@ _PRED_COLUMNS = [
     "target_open", "predicted_at", "predicted", "score", "price", "actual", "result",
 ]
 
-_CALL_GLYPH = {"UP": "▲ UP", "DOWN": "▼ DOWN", "NEUTRAL": "■ NEUTRAL"}
-_ACTUAL_GLYPH = {"up": "▲ up", "down": "▼ down", "flat": "– flat"}
+_CALL_GLYPH = {"UP": "UP", "DOWN": "DOWN", "NEUTRAL": "NEUTRAL"}
+_ACTUAL_GLYPH = {"up": "up", "down": "down", "flat": "flat"}
 
 # A hit rate on a handful of calls is noise: 2/3 = 67% is one lucky flip, and
 # flipping a fair coin 6 times gives 2 heads all the time.  Below this many
@@ -225,7 +226,7 @@ def update_predictions(
             ok = (pr["predicted"] == "UP" and actual == "up") or (
                 pr["predicted"] == "DOWN" and actual == "down"
             )
-            pr["result"] = "✅" if ok else "❌"
+            pr["result"] = "correct" if ok else "wrong"
 
     if len(preds) > max_keep:
         keep = sorted(preds.items(), key=lambda kv: kv[1]["predicted_at"])[-max_keep:]
@@ -256,10 +257,10 @@ def _direction_stats(
     """Scored tally for a single call direction ("UP" or "DOWN")."""
     scored = [
         p for p in preds.values()
-        if p["predicted"] == call and p["result"] in ("✅", "❌")
+        if p["predicted"] == call and p["result"] in ("correct", "wrong")
     ]
     n = len(scored)
-    ok = sum(1 for p in scored if p["result"] == "✅")
+    ok = sum(1 for p in scored if p["result"] == "correct")
     pending = sum(
         1 for p in preds.values()
         if p["predicted"] == call and p["result"] is None
@@ -293,14 +294,14 @@ def predictions_table(
             "Conf": _strength(p.get("score", 0.0)),
             "Price": f"${p['price']:,.0f}",
             "Target candle": pd.Timestamp(p["target_open"]).strftime("%H:%M"),
-            "Actual": _ACTUAL_GLYPH.get(p["actual"], "⏳ pending"),
-            "Result": p["result"] or "⏳",
+            "Actual": _ACTUAL_GLYPH.get(p["actual"], "pending"),
+            "Result": p["result"] or "pending",
         }
         for p in rows
     ], columns=cols)
 
-    scored = [p for p in preds.values() if p["result"] in ("✅", "❌")]
-    n_correct = sum(1 for p in scored if p["result"] == "✅")
+    scored = [p for p in preds.values() if p["result"] in ("correct", "wrong")]
+    n_correct = sum(1 for p in scored if p["result"] == "correct")
     summary = {
         "n_scored": len(scored),
         "n_correct": n_correct,
@@ -393,13 +394,13 @@ def accuracy_over_time(preds: dict[str, dict[str, Any]]) -> pd.DataFrame:
         chronological.  Empty if nothing has been scored yet.
     """
     scored = sorted(
-        (p for p in preds.values() if p["result"] in ("✅", "❌")),
+        (p for p in preds.values() if p["result"] in ("correct", "wrong")),
         key=lambda p: p["predicted_at"],
     )
     rows: list[dict[str, Any]] = []
     correct = 0
     for i, p in enumerate(scored, start=1):
-        if p["result"] == "✅":
+        if p["result"] == "correct":
             correct += 1
         rows.append({
             "time": pd.Timestamp(p["predicted_at"]),

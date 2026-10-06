@@ -8,7 +8,7 @@ trained on):
 * :func:`build_signal_ledger` — **when & where**: each BUY/SELL call with its
   date and entry price ("here is where the model said act").
 * :func:`build_scorecard` — **right vs wrong**: the same calls annotated with the
-  realized outcome N days later and a ✅/❌, plus a summary tally.
+  realized outcome N days later and a pass/fail tally.
 
 These are honest, leakage-free records — every marked row already has a known
 outcome and the model never saw the test split.  They are *not* a promise of
@@ -74,7 +74,7 @@ def build_scorecard(
         "Signal": df["signal"].astype("string"),
         "Entry": df["price"].map(lambda p: f"${p:,.0f}"),
         "Outcome": df["realized"].map({"up": "▲ up", "down": "▼ down"}).astype("string"),
-        "Result": df["correct"].map(lambda c: "✅ correct" if c else "❌ wrong"),
+        "Result": df["correct"].map(lambda c: "correct" if c else "wrong"),
     })
     n_total = len(df)
     n_correct = int(df["correct"].sum())

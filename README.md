@@ -1,4 +1,22 @@
-# BTC Price-Behaviour Indicator
+<div align="center">
+
+# ₿ BTC Price-Behaviour Indicator
+
+**A leakage-proof research pipeline and live Streamlit command center for BTC/USDT — built to tell the truth, not to sell a strategy.**
+
+[![CI](https://github.com/Abhinav-Malik-154/Indicator/actions/workflows/ci.yml/badge.svg)](https://github.com/Abhinav-Malik-154/Indicator/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)
+![Streamlit](https://img.shields.io/badge/dashboard-Streamlit-FF4B4B?logo=streamlit&logoColor=white)
+![Tests](https://img.shields.io/badge/tests-560%20passing-2ea44f)
+![Lint](https://img.shields.io/badge/lint-ruff-D7FF64)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE.md)
+![Status](https://img.shields.io/badge/status-research%20%2F%20forward--testing-F0B90B)
+
+[Dashboard guide](DASHBOARD.md) · [Methodology](PHASES.md) · [Monitoring](MONITORING.md) · [Contributing](CONTRIBUTING.md) · [License](LICENSE.md)
+
+<img src="docs/assets/dashboard/command-center.png" alt="BTC Command Center: volatility regime, expected move and direction guardrail cards" width="100%" />
+
+</div>
 
 A 7-phase research project studying short-horizon BTC/USDT price prediction.
 The goal was to build a price-direction indicator with production-grade
@@ -9,11 +27,10 @@ directional edge**.
 This project exists to show how to do this kind of work correctly, not to
 sell a winning trading strategy.
 
-> **Status:** Research and forward-testing project. The current evidence does
-> not demonstrate a directional edge. Do not use this project as financial
-> advice or as an automated trading system.
-
-[Dashboard](DASHBOARD.md) · [Contributing](CONTRIBUTING.md) · [License](LICENSE.md)
+> [!WARNING]
+> **Research and forward-testing project.** The current evidence does not
+> demonstrate a directional edge. Do not use this project as financial advice
+> or as an automated trading system.
 
 ## At A Glance
 
@@ -23,55 +40,63 @@ sell a winning trading strategy.
 | Validation | Chronological walk-forward splits with leakage controls |
 | Models | Logistic regression and LightGBM |
 | Current finding | No demonstrated out-of-sample directional edge |
-| Dashboard | Streamlit app with live market context and model signals |
+| Dashboard | Streamlit command center: live TradingView chart, signal scorecard, risk-managed paper trading |
+| Quality | 560 tests, ruff lint, CI on every push |
 
-## Dashboard Preview
+## ✨ What's New in the Dashboard
+
+The dashboard has been rebuilt from a plain signal readout into a full
+**command center** — darker, denser, Binance-style, and still honest about
+what the model can and cannot do.
+
+| Upgrade | What it gives you |
+|---|---|
+| ₿ **Command Center header** | Live price plus three honest KPI cards — volatility regime (the real edge), expected move (the honest "how much"), and a coin-flip guardrail on direction |
+| 📈 **Live TradingView chart** | Real streaming candles with a 1m → 1W timeframe switcher, market picker and light/dark toggle |
+| 🚦 **Live signal call** | STRONG BUY → STRONG SELL rating from EMA, SMA, RSI, MACD and momentum, auto-refreshing every ~15s |
+| 📋 **Signal ledger & scorecard** | Every out-of-sample BUY/SELL call next to how it actually landed, with a live correct / wrong / hit-rate tally |
+| 💼 **Risk-managed paper trading** | ₹10,000 fake-money account: volatility-gated entries, ATR stop-loss, 2:1 take-profit, fees included, benchmarked against buy-and-hold |
+| 🔁 **Validated retrain** | One-click retrain that only promotes a new model if it passes the leak-tripwire gate, with an audit log |
+
+## 🖥️ Dashboard Preview
 
 The dashboard is the project's operational view for live candles, model
 signals, historical scorecards, volatility context, and the leakage-immune
-forward test. Keep screenshots under [`docs/assets/dashboard/`](docs/assets/dashboard/)
-so they can be refreshed without changing the README structure.
+forward test.
 
-<div align="center">
-  <table width="100%" cellpadding="10" cellspacing="0" border="0">
-    <tr>
-      <td width="48%" valign="top" style="padding-right: 14px;">
-        <div style="background:#0f172a;border:1px solid #2b3342;border-radius:10px;padding:12px;">
-          <div style="font-size:14px;font-weight:700;color:#e5e7eb;margin-bottom:10px;">
-            When & where — the model's BUY/SELL calls
-          </div>
-          <img src="docs/assets/dashboard/ledger/ledger.png" alt="Signal ledger panel" width="100%" style="border-radius:8px;border:1px solid #2b3342;display:block;" />
-          <div style="font-size:12px;color:#9ca3af;margin-top:8px;">
-            Paste the ledger screenshot here.
-          </div>
-        </div>
-      </td>
-      <td width="48%" valign="top" style="padding-left: 14px;">
-        <div style="background:#0f172a;border:1px solid #2b3342;border-radius:10px;padding:12px;">
-          <div style="font-size:14px;font-weight:700;color:#e5e7eb;margin-bottom:10px;">
-            Right vs wrong — how those calls landed
-          </div>
-          <img src="docs/assets/dashboard/scorecard/scorecard.png" alt="Signal scorecard panel" width="100%" style="border-radius:8px;border:1px solid #2b3342;display:block;" />
-          <div style="font-size:12px;color:#9ca3af;margin-top:8px;">
-            Paste the scorecard screenshot here.
-          </div>
-        </div>
-      </td>
-    </tr>
-    <tr>
-      <td colspan="2" style="padding-top: 18px;">
-        <div style="background:#0f172a;border:1px solid #2b3342;border-radius:10px;padding:12px;">
-          <div style="font-size:14px;font-weight:700;color:#e5e7eb;margin-bottom:10px;">
-            Full dashboard overview
-          </div>
-          <img src="docs/assets/dashboard/full/full-dashboard.png" alt="Full dashboard view" width="100%" style="border-radius:8px;border:1px solid #2b3342;display:block;" />
-        </div>
-      </td>
-    </tr>
-  </table>
-</div>
+<table>
+  <tr>
+    <td colspan="2">
+      <b>📈 Live chart + signal call</b><br/>
+      <sub>TradingView candles with an auto-refreshing technical rating. A transparent rule-based indicator, not a proven-profit signal.</sub><br/><br/>
+      <img src="docs/assets/dashboard/live-chart.png" alt="Live TradingView BTC/USDT chart with STRONG SELL signal call" width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <b>📋 Signal ledger & scorecard</b><br/>
+      <sub>When and where the model called BUY/SELL, and whether each call was right. Out-of-sample only.</sub><br/><br/>
+      <img src="docs/assets/dashboard/signal-ledger.png" alt="Signal ledger and scorecard tables with correct, wrong and hit-rate tally" width="100%" />
+    </td>
+    <td width="50%" valign="top">
+      <b>💼 Risk-managed paper trading</b><br/>
+      <sub>Equity, P&L, drawdown and fees for a ₹10,000 fake-money account, plotted against buy-and-hold.</sub><br/><br/>
+      <img src="docs/assets/dashboard/paper-trading.png" alt="Paper trading KPIs and equity curve vs buy-and-hold" width="100%" />
+    </td>
+  </tr>
+</table>
 
-> Replace the placeholder filenames with the final screenshots you capture from the app.
+<details>
+<summary><b>🧾 Paper-trading trade log</b> (click to expand)</summary>
+<br/>
+<img src="docs/assets/dashboard/trade-log.png" alt="Paper trading trade log with entries, exits, fees and realized P&L" width="100%" />
+<sub>Every fill with price, size, fee, realized P&L and the exit reason (entry / target / stop).</sub>
+</details>
+
+> [!NOTE]
+> Numbers in the screenshots are a snapshot from a single session. The paper
+> account trails buy-and-hold in that snapshot, and the out-of-sample hit rate is
+> ~38%. The dashboard shows these figures as they are.
 
 See [DASHBOARD.md](DASHBOARD.md) for the complete panel guide and launch
 instructions.
@@ -258,7 +283,7 @@ python -m src.monitor.record_signal        # schedule daily — see MONITORING.m
 ### Tests and lint
 
 ```bash
-pytest           # 269 tests — never touch the real API
+pytest           # 560 tests — never touch the real API
 ruff check .     # lint
 ```
 
@@ -275,7 +300,7 @@ Both run in CI on every push and pull request (`.github/workflows/ci.yml`).
 | Modeling | `scikit-learn`, `lightgbm` | logistic regression, gradient boosting |
 | Backtest | custom (`src/backtest/`) | per-day equity simulation with fee accounting |
 | Dashboard | `streamlit`, `plotly` | live signal display + candlestick chart |
-| Tests | `pytest` | 310 unit tests |
+| Tests | `pytest` | 560 unit tests |
 | Lint | `ruff` | enforced in CI |
 
 ---
@@ -311,10 +336,14 @@ src/
     alerts.py                     # non-silent signal banners + browser notifications
     freshness.py                  # staleness check + validated retrain-and-promote
     live_track_record.py          # leakage-immune live forward-test accuracy
+    ledger.py                     # signal ledger + right/wrong scorecard
+    technical_rating.py           # live STRONG BUY → STRONG SELL rating
+    tradingview.py                # embedded TradingView live chart
+    risk_trader.py                # risk-managed paper trading (stop/target)
     app.py                        # Streamlit dashboard
   monitor/
     record_signal.py              # standalone daily signal recorder (append-only log)
-tests/                            # 310 unit tests
+tests/                            # 560 unit tests
 notebooks/
   01–07_*.ipynb                   # visualisation and reporting notebooks
 data/raw/                         # candles + manifests (git-ignored)
