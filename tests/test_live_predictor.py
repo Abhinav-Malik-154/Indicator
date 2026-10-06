@@ -93,7 +93,7 @@ class TestUpdatePredictions:
         c2 = _append_candle(c, preds[key]["target_open"], match)
         preds = update_predictions(preds, c2, live_price=float(c2["close"].iloc[-1]),
                                    now=now + pd.Timedelta(minutes=1))
-        assert preds[key]["result"] == "✅"
+        assert preds[key]["result"] == "correct"
 
     def test_wrong_when_outcome_opposes_call(self):
         c = _candles(60, drift=0.5)
@@ -107,7 +107,7 @@ class TestUpdatePredictions:
         c2 = _append_candle(c, preds[key]["target_open"], opposite)
         preds = update_predictions(preds, c2, live_price=float(c2["close"].iloc[-1]),
                                    now=now + pd.Timedelta(minutes=1))
-        assert preds[key]["result"] == "❌"
+        assert preds[key]["result"] == "wrong"
 
     def test_signal_is_two_sided(self):
         # An oscillating series must produce BOTH up and down calls — the whole
@@ -146,7 +146,7 @@ class TestUpdatePredictions:
                 "predicted_at": pd.Timestamp(f"2026-08-22 {h:02d}:00", tz="UTC"),
                 "predicted": "UP", "score": 1.0, "price": 100.0,
                 "target_open": pd.Timestamp(f"2026-08-22 {h:02d}:01", tz="UTC"),
-                "actual": None, "result": "✅",
+                "actual": None, "result": "correct",
             }
             for h in range(10)
         }
@@ -198,11 +198,11 @@ class TestDirectionBreakdown:
 
     def test_separate_buy_and_sell_hit_rates(self):
         preds = {
-            "a": self._mk("UP", "✅", 1.0, 10),
-            "b": self._mk("UP", "❌", 0.33, 11),
-            "c": self._mk("DOWN", "✅", 0.67, 12),
-            "d": self._mk("DOWN", "✅", 1.0, 13),
-            "e": self._mk("DOWN", "❌", 0.33, 14),
+            "a": self._mk("UP", "correct", 1.0, 10),
+            "b": self._mk("UP", "wrong", 0.33, 11),
+            "c": self._mk("DOWN", "correct", 0.67, 12),
+            "d": self._mk("DOWN", "correct", 1.0, 13),
+            "e": self._mk("DOWN", "wrong", 0.33, 14),
             "f": self._mk("UP", None, 0.67, 15),  # pending
         }
         _, summ = predictions_table(preds)
@@ -214,8 +214,8 @@ class TestDirectionBreakdown:
 
     def test_confidence_column_labels(self):
         table, _ = predictions_table({
-            "a": self._mk("UP", "✅", 1.0, 10),   # |score|=1.0 → firm
-            "b": self._mk("DOWN", "❌", 0.2, 11),  # |score|=0.2 → faint
+            "a": self._mk("UP", "correct", 1.0, 10),   # |score|=1.0 → firm
+            "b": self._mk("DOWN", "wrong", 0.2, 11),  # |score|=0.2 → faint
         })
         assert "Conf" in table.columns
         confs = set(table["Conf"])
@@ -301,8 +301,8 @@ class TestAccuracyOverTime:
 
     def test_cumulative_hit_rate(self):
         preds = {
-            "a": self._mk("✅", 1), "b": self._mk("✅", 2),
-            "c": self._mk("❌", 3), "d": self._mk("✅", 4),
+            "a": self._mk("correct", 1), "b": self._mk("correct", 2),
+            "c": self._mk("wrong", 3), "d": self._mk("correct", 4),
         }
         df = accuracy_over_time(preds)
         assert list(df["n"]) == [1, 2, 3, 4]
@@ -313,7 +313,7 @@ class TestAccuracyOverTime:
         assert df["time"].is_monotonic_increasing
 
     def test_ignores_pending_and_neutral(self):
-        preds = {"a": self._mk("✅", 1), "b": self._mk(None, 2), "c": self._mk("—", 3)}
+        preds = {"a": self._mk("correct", 1), "b": self._mk(None, 2), "c": self._mk("—", 3)}
         assert len(accuracy_over_time(preds)) == 1
 
     def test_empty(self):
@@ -336,7 +336,7 @@ class TestPersistence:
             "predicted_at": pd.Timestamp("2026-08-22 10:57", tz="UTC"),
             "predicted": "DOWN", "score": -0.42, "price": 129.5,
             "target_open": extra_open,
-            "actual": "down", "result": "✅",
+            "actual": "down", "result": "correct",
         }
         return preds
 
@@ -383,7 +383,7 @@ class TestSampleSizeGuard:
         }
 
     def test_small_sample_not_reliable(self):
-        preds = {str(i): self._mk("UP", "✅", i) for i in range(3)}  # 3/3 = 100%
+        preds = {str(i): self._mk("UP", "correct", i) for i in range(3)}  # 3/3 = 100%
         _, summ = predictions_table(preds)
         assert summ["hit_rate"] == 100.0        # value still computed…
         assert summ["reliable"] is False        # …but flagged not trustworthy
@@ -393,7 +393,7 @@ class TestSampleSizeGuard:
     def test_big_sample_reliable(self):
         n = MIN_SCORED_FOR_HIT_RATE + 5
         preds = {
-            str(i): self._mk("UP", "✅" if i % 2 else "❌", i) for i in range(n)
+            str(i): self._mk("UP", "correct" if i % 2 else "wrong", i) for i in range(n)
         }
         _, summ = predictions_table(preds)
         assert summ["reliable"] is True

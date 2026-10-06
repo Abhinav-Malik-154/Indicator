@@ -49,7 +49,7 @@ class TestScorecard:
     def test_table_columns_and_result_glyphs(self, markers):
         tbl, _ = build_scorecard(markers)
         assert list(tbl.columns) == ["Date", "Signal", "Entry", "Outcome", "Result"]
-        assert tbl["Result"].iloc[0] in {"✅ correct", "❌ wrong"}
+        assert tbl["Result"].iloc[0] in {"correct", "wrong"}
         assert set(tbl["Outcome"]) <= {"▲ up", "▼ down"}
 
     def test_summary_reflects_all_rows_even_when_table_limited(self, markers):
