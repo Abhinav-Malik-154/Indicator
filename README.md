@@ -2,7 +2,7 @@
 
 # ₿ BTC Price And Behaviour Indicator
 
-**A leakage-proof research pipeline and live Streamlit command center for BTC/USDT — built to tell the truth and spread awareness not to sell a strategy.**
+**A leakage-proof research pipeline and live Streamlit command center for BTC/USDT — built to tell the truth and spread awareness not to sell a strategy with complete and Real data.**
 
 [![CI](https://github.com/Abhinav-Malik-154/Indicator/actions/workflows/ci.yml/badge.svg)](https://github.com/Abhinav-Malik-154/Indicator/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)
