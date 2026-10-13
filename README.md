@@ -1,6 +1,6 @@
 <div align="center">
 
-# ₿ BTC Price And Behaviour Indicator Signal
+# ₿ BTC Price And Behaviour Indicator
 
 **A leakage-proof research pipeline and live Streamlit command center for BTC/USDT — built to tell the truth and spread awareness not to sell a strategy with complete and Real data.**
 
